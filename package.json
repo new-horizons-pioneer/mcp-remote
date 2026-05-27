@@ -1,7 +1,7 @@
 {
-  "name": "mcp-remote",
-  "version": "0.1.38",
-  "description": "Remote proxy for Model Context Protocol, allowing local-only clients to connect to remote servers using oAuth",
+  "name": "@thespeakup/mcp-remote",
+  "version": "0.1.38-thespeakup.0",
+  "description": "Temporary SpeakUp fork of mcp-remote with the cold-start initialize-before-OAuth fix (see https://github.com/geelen/mcp-remote/pull/272). Use plain `mcp-remote` once that PR ships.",
   "keywords": [
     "mcp",
     "stdio",
@@ -9,9 +9,11 @@
     "remote",
     "oauth"
   ],
-  "author": "Glen Maddern <glen@glenmaddern.com>",
+  "author": "Glen Maddern <glen@glenmaddern.com> (fork maintained by SpeakUp)",
   "license": "MIT",
-  "repository": "https://github.com/geelen/mcp-remote",
+  "repository": "https://github.com/new-horizons-pioneer/mcp-remote",
+  "bugs": "https://github.com/new-horizons-pioneer/mcp-remote/issues",
+  "homepage": "https://github.com/geelen/mcp-remote/pull/272",
   "type": "module",
   "files": [
     "dist",
