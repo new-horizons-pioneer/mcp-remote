@@ -16,7 +16,6 @@ import {
   connectToRemoteServer,
   log,
   debugLog,
-  mcpProxy,
   parseCommandLineArgs,
   setupSignalHandlers,
   TransportStrategy,
@@ -161,40 +160,48 @@ to the CA certificate file. If using claude_desktop_config.json, this might look
   }
   setupSignalHandlers(cleanup)
 
-  if (warmCache) {
-    // === Warm path (behaviour-preserving for cached users) ===
-    try {
-      const remoteTransport = await discoverAndConnect()
-      remoteTransportRef.current = remoteTransport
-
-      mcpProxy({
-        transportToClient: localTransport,
-        transportToServer: remoteTransport,
-        ignoredTools,
-      })
-
-      await localTransport.start()
-      log('Local STDIO server running (warm-cache path)')
-      log(`Proxy established successfully between local STDIO and remote ${remoteTransport.constructor.name}`)
-      log('Press Ctrl+C to exit')
-    } catch (error) {
-      log('Fatal error:', error)
-      fatalErrorHint(error)
-      if (server) server.close()
-      process.exit(1)
-    }
-    return
-  }
-
-  // === Cold path (no/expired tokens) — deferred bridge ===
-  // Start the local STDIO transport IMMEDIATELY with a pre-handshake handler
-  // so the MCP client's `initialize` request gets answered locally (with
-  // empty capabilities + listChanged:true) within milliseconds, well under
-  // the 60 s client-side timeout. OAuth + remote connect run in background.
+  // === Unified deferred-bridge path (both warm and cold caches) ===
+  //
+  // The deferred bridge installs the local STDIO ``onmessage`` handler
+  // **synchronously** before ``localTransport.start()`` runs, so any
+  // ``initialize`` request the MCP client (Claude Desktop, Cursor,
+  // Windsurf, ...) sends in the milliseconds between process spawn and
+  // ``start()`` is answered immediately — well under the 60 s
+  // client-side request timeout.
+  //
+  // Earlier versions of this proxy preserved a "warm-cache" fast path
+  // that awaited ``discoverAndConnect()`` (≈ 1.5 s of OAuth metadata
+  // discovery + remote transport bring-up) BEFORE calling
+  // ``localTransport.start()``. That ordering raced the client's
+  // ``initialize`` request: the client wrote it to stdin as soon as it
+  // saw the process exist, the bridge had no listener attached yet, and
+  // by the time ``start()`` finally ran the message had silently
+  // disappeared between Node's spawned-process stdin buffer and the
+  // late-bound STDIO transport — the request was logged at the host
+  // (Claude Desktop's ``mcp-server-<name>.log``) but never produced a
+  // ``[Local→Remote] initialize`` entry in this proxy's log, and the
+  // host eventually emitted ``notifications/cancelled`` with
+  // ``McpError: MCP error -32001: Request timed out`` ~60 s later. The
+  // bridge then closed and the user got a stuck "connecting" UI with
+  // no diagnostic surface.
+  //
+  // Unifying on the deferred bridge eliminates the race entirely: the
+  // bridge answers ``initialize`` with empty capabilities (and
+  // ``listChanged: true`` on tools/resources/prompts) within
+  // milliseconds, ``discoverAndConnect()`` runs in the background, and
+  // once the remote attaches the bridge re-issues ``initialize``
+  // upstream and emits the relevant ``notifications/<domain>/list_changed``
+  // so the client re-queries the real tool/resource/prompt lists.
+  //
+  // Trade-off for warm-cache users: ~100 – 1500 ms of empty
+  // ``tools/list`` before the upstream attaches and ``list_changed``
+  // fires. Acceptable, given the only alternative is a wedged
+  // connector for every user that lands on the race window.
   const bridge = createDeferredMcpBridge({ transportToClient: localTransport, ignoredTools })
 
   await localTransport.start()
-  log('Local STDIO server running (deferred bridge — answering initialize while OAuth completes in background)')
+  log('Local STDIO server running (deferred bridge — answering initialize while remote connect proceeds in background)')
+  debugLog('Token cache state at start', { warmCache })
   log('Press Ctrl+C to exit')
 
   discoverAndConnect()

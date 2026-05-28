@@ -1,6 +1,6 @@
 {
   "name": "@thespeakup/mcp-remote",
-  "version": "0.1.38-thespeakup.0",
+  "version": "0.1.38-thespeakup.1",
   "description": "Temporary SpeakUp fork of mcp-remote with the cold-start initialize-before-OAuth fix (see https://github.com/geelen/mcp-remote/pull/272). Use plain `mcp-remote` once that PR ships.",
   "keywords": [
     "mcp",
