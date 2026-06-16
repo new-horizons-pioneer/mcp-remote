@@ -31,6 +31,7 @@ declare global {
 // Connection constants
 export const REASON_AUTH_NEEDED = 'authentication-needed'
 export const REASON_TRANSPORT_FALLBACK = 'falling-back-to-alternate-transport'
+export const REASON_SILENT_REAUTH = 'silent-reauth-from-persisted-token'
 
 // Transport strategy types
 export type TransportStrategy = 'sse-only' | 'http-only' | 'sse-first' | 'http-first'
@@ -763,6 +764,31 @@ export async function connectToRemoteServer(
         errorMessage: error.message,
         stack: error.stack,
       })
+
+      // Silent re-auth before falling back to an interactive browser flow.
+      //
+      // Claude Desktop (and any host) spawns multiple mcp-remote processes that
+      // share a single on-disk token store. When the short-lived access token
+      // expires, several transports race to refresh it. Because the server
+      // rotates refresh tokens, only the winning request gets a fresh pair — the
+      // losers end up here. The SDK transport has already tried (and failed) its
+      // own refresh by this point, but the winning process has very likely just
+      // persisted a valid token to the shared store (the provider suppresses the
+      // browser in that case — see NodeOAuthClientProvider.redirectToAuthorization).
+      // Reconnect once with that freshly-persisted token instead of authorizing.
+      //
+      // Guarded by REASON_SILENT_REAUTH so we attempt it at most once; if the
+      // reconnect still fails we fall through to the interactive flow.
+      const siblingAware = authProvider as Partial<{ hasSiblingRefreshedToken: () => Promise<boolean> }>
+      if (!recursionReasons.has(REASON_SILENT_REAUTH) && typeof siblingAware.hasSiblingRefreshedToken === 'function') {
+        if (await siblingAware.hasSiblingRefreshedToken()) {
+          recursionReasons.add(REASON_SILENT_REAUTH)
+          log('A sibling process refreshed the token; reconnecting without browser auth')
+          debugLog('Silent re-auth: sibling-refreshed token detected, reconnecting')
+          return connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy, recursionReasons)
+        }
+        debugLog('Silent re-auth: no sibling-refreshed token, falling back to browser flow')
+      }
 
       // Initialize authentication on-demand
       debugLog('Calling authInitializer to start auth flow')

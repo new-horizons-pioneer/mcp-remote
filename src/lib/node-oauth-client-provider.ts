@@ -34,6 +34,14 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   private authorizationServerMetadata: AuthorizationServerMetadata | undefined
   private protectedResourceMetadata: ProtectedResourceMetadata | undefined
   private wwwAuthenticateScope: string | undefined
+  // The access token most recently served to a transport via `tokens()`. Used to
+  // detect when a *sibling* mcp-remote process (sharing this token store) has
+  // refreshed the token out from under us, so we can reuse its result instead of
+  // opening a redundant interactive browser flow. See redirectToAuthorization().
+  private lastReadAccessToken: string | undefined
+  // Grace period to let a sibling's in-flight refresh land before we give up and
+  // open a browser. Only applied to re-auth (never to a cold first authorization).
+  private static readonly SIBLING_REFRESH_GRACE_MS = 400
 
   /**
    * Creates a new NodeOAuthClientProvider
@@ -189,11 +197,33 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    * Gets the OAuth tokens if they exist
    * @returns The OAuth tokens or undefined
    */
+  /**
+   * Reads the persisted tokens from disk WITHOUT mutating `lastReadAccessToken`.
+   * Used by the concurrent-refresh guards so their bookkeeping reads don't
+   * clobber the "token we last served to a transport" signal.
+   */
+  private async readPersistedTokens(): Promise<OAuthTokens | undefined> {
+    return readJsonFile<OAuthTokens>(this.serverUrlHash, 'tokens.json', OAuthTokensSchema)
+  }
+
+  /**
+   * True when a sibling process has persisted an access token different from the
+   * one we last served — i.e. a concurrent refresh succeeded and we should reuse
+   * it rather than starting a fresh interactive authorization. Non-mutating.
+   */
+  async hasSiblingRefreshedToken(): Promise<boolean> {
+    const lastUsed = this.lastReadAccessToken
+    if (!lastUsed) return false // cold start — nothing was ever served, so no sibling race
+    const persisted = await this.readPersistedTokens()
+    return !!persisted?.access_token && persisted.access_token !== lastUsed
+  }
+
   async tokens(): Promise<OAuthTokens | undefined> {
     debugLog('Reading OAuth tokens')
     debugLog('Token request stack trace:', new Error().stack)
 
-    const tokens = await readJsonFile<OAuthTokens>(this.serverUrlHash, 'tokens.json', OAuthTokensSchema)
+    const tokens = await this.readPersistedTokens()
+    this.lastReadAccessToken = tokens?.access_token
 
     if (tokens) {
       const timeLeft = tokens.expires_in || 0
@@ -253,6 +283,35 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    * @param authorizationUrl The URL to redirect to
    */
   async redirectToAuthorization(authorizationUrl: URL): Promise<void> {
+    // Concurrent-refresh guard.
+    //
+    // Reaching this method means the SDK decided a *new* authorization is needed
+    // (our token refresh failed). But hosts like Claude Desktop run several
+    // mcp-remote processes against one shared token store, and the server rotates
+    // refresh tokens: when the short-lived access token expires, multiple
+    // transports race to refresh and only one wins — the losers land here even
+    // though a perfectly good token was just persisted by the winner. Opening a
+    // browser in that case is pointless (and its loopback callback usually races
+    // against process teardown, surfacing as ERR_CONNECTION_REFUSED).
+    //
+    // So: if a sibling already refreshed, skip the browser. Returning without
+    // opening makes the SDK surface UnauthorizedError, which connectToRemoteServer
+    // recovers from by reconnecting with the freshly-persisted token. We only do
+    // this for re-auth (lastReadAccessToken set), never a cold first login, and we
+    // allow a short grace for a sibling's in-flight refresh to land.
+    if (this.lastReadAccessToken) {
+      let siblingRefreshed = await this.hasSiblingRefreshedToken()
+      if (!siblingRefreshed) {
+        await new Promise((resolve) => setTimeout(resolve, NodeOAuthClientProvider.SIBLING_REFRESH_GRACE_MS))
+        siblingRefreshed = await this.hasSiblingRefreshedToken()
+      }
+      if (siblingRefreshed) {
+        log('A sibling process already refreshed the token; skipping interactive authorization.')
+        debugLog('redirectToAuthorization: sibling-refreshed token detected, skipping browser')
+        return
+      }
+    }
+
     // Optionally fetch metadata for debugging/informational purposes (non-blocking)
     this.getAuthorizationServerMetadata().catch(() => {
       // Ignore errors, metadata is optional
