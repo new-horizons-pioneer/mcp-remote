@@ -929,44 +929,54 @@ export function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbackServe
       color: #1f2937; padding: 24px;
     }
     @media (prefers-color-scheme: dark) {
-      body { background: radial-gradient(1200px 600px at 50% -10%, #2e1065 0%, #1e1b2e 45%, #0f0f17 100%); color: #e5e7eb; }
+      body { background: radial-gradient(1200px 600px at 50% -10%, #2e1065 0%, #1e1b2e 45%, #0f0f17 100%); color: #f3f4f6; }
       .card { background: #17151f; border-color: rgba(255,255,255,0.08); }
+      .wordmark { color: #f3f4f6; }
       .hint { color: #9ca3af; }
     }
     .card {
-      width: 100%; max-width: 420px; background: #ffffff; border: 1px solid rgba(17,24,39,0.08);
-      border-radius: 16px; padding: 40px 32px; text-align: center;
-      box-shadow: 0 12px 40px rgba(76,29,149,0.12);
+      width: 100%; max-width: 440px; background: #ffffff; border: 1px solid rgba(17,24,39,0.08);
+      border-radius: 18px; padding: 40px 34px; text-align: center;
+      box-shadow: 0 16px 48px rgba(76,29,149,0.14);
     }
-    .badge {
-      width: 64px; height: 64px; margin: 0 auto 20px; border-radius: 50%;
-      display: flex; align-items: center; justify-content: center;
-      background: linear-gradient(135deg, #7c3aed 0%, #a78bfa 100%);
-      box-shadow: 0 8px 24px rgba(124,58,237,0.35);
+    .brandrow { display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 28px; }
+    .brandrow svg { width: 40px; height: 40px; display: block; }
+    .wordmark { font-size: 22px; font-weight: 700; letter-spacing: -0.02em; color: #18181b; }
+    h1 { font-size: 21px; font-weight: 600; margin: 0 0 10px; letter-spacing: -0.01em; }
+    p { margin: 0; font-size: 15px; line-height: 1.55; }
+    .btn {
+      display: inline-block; margin-top: 26px; padding: 12px 26px; border: none; border-radius: 12px;
+      background: #7c3aed; color: #ffffff; font-size: 15px; font-weight: 600; cursor: pointer;
+      text-decoration: none; transition: background 0.15s ease, transform 0.05s ease;
     }
-    .badge svg { width: 32px; height: 32px; }
-    h1 { font-size: 20px; font-weight: 650; margin: 0 0 8px; letter-spacing: -0.01em; }
-    p { margin: 0; font-size: 15px; line-height: 1.5; }
-    .hint { margin-top: 14px; font-size: 13px; color: #6b7280; }
-    .brand { margin-top: 24px; font-size: 12px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #7c3aed; }
+    .btn:hover { background: #6d28d9; }
+    .btn:active { transform: scale(0.98); }
+    .hint { margin-top: 16px; font-size: 13px; color: #6b7280; }
   </style>
 </head>
 <body>
   <main class="card">
-    <div class="badge" aria-hidden="true">
-      <svg viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M20 6 9 17l-5-5" />
+    <div class="brandrow">
+      <svg viewBox="0 0 300 300" role="img" aria-label="SpeakUp logo" xmlns="http://www.w3.org/2000/svg">
+        <g>
+          <g fill="#cce647" transform="matrix(.1 0 0 -.1 0 300)"><path d="M1265 2955c-262-46-472-144-693-320l-82-67-68-77c-152-174-249-345-311-549-36-116-48-167-57-247-8-72-8-337 0-381 3-18 8-52 11-75 11-90 71-270 128-386 80-163 164-278 293-405C715 222 999 82 1315 40l79-10 151 3 150 4 105 22 104 22 96 36c360 134 646 396 816 748l53 110 35 121c19 66 39 156 45 200l10 79-3 161c-2 88-6 165-9 171l-7 11-42-14c-24-8-62-21-85-30l-42-15 4-12c2-7 6-43 9-80l6-69-15-136c-16-148-27-194-73-317-111-292-320-532-593-678-111-60-192-91-319-122l-105-26-145-4-145-4-105 19c-285 51-522 178-716 382l-81 86-56 85c-30 46-69 111-86 144-42 85-98 254-115 348l-14 80v290l14 80c18 101 73 264 124 364 155 303 418 528 743 636l102 34 104 17 104 17 136-6 136-6 72-16c180-39 344-111 487-214 84-59 217-184 255-239l22-32-16-7c-10-3-326-106-704-228l-686-223-1-220-1-220 410-313c226-173 413-315 417-317l8-3 3 103c2 57 3 148 3 202l1 100-210 164c-115 90-211 167-213 171-1 4 19 13 45 20 27 8 134 41 238 74 105 32 217 67 250 77 426 129 835 259 835 264 0 2-9 28-20 60-165 481-567 841-1070 958l-85 19-190 4-190 4-80-14z"></path></g>
+          <g fill="#a5cf43" transform="matrix(.1 0 0 -.1 0 300)"><path d="m1113 1596 5-218 16-11c81-63 781-595 795-605l19-13 3 108c1 59 3 151 3 203l1 95-325 253c-179 139-370 287-424 329l-99 76 6-217z"></path></g>
+          <g fill="#69ac4c" transform="matrix(.1 0 0 -.1 0 300)"><path d="m1312 1439-183-60 6-9c3-5 98-80 210-165l205-156 192 47c106 25 197 50 201 54l8 7-219 172c-121 94-224 171-228 170-5 0-91-27-192-60z"></path></g>
+          <g fill="#42973c" transform="matrix(.1 0 0 -.1 0 300)"><path d="M1322 1436c-100-33-181-64-180-68 2-3 73-59 158-124s173-133 194-151l40-33h20c12 0 106 21 211 47l190 46-29 21c-41 30-314 242-360 280-21 17-43 34-50 37l-11 6-183-61z"></path></g>
+        </g>
       </svg>
+      <span class="wordmark">SpeakUp</span>
     </div>
     <h1>Authorization complete</h1>
-    <p>You're connected to SpeakUp. You can close this window and return to Claude.</p>
-    <p class="hint">This tab should close automatically.</p>
-    <div class="brand">SpeakUp</div>
+    <p>You're connected to SpeakUp. You can return to Claude and continue.</p>
+    <button class="btn" type="button" onclick="window.close()">Return to Claude</button>
+    <p class="hint">If this tab doesn't close, you can close it manually.</p>
   </main>
   <script>
-    // Non-interactive sessions auto-close. If the browser blocks programmatic
-    // close (interactive approval happened here), the message above stays visible.
-    window.close()
+    // Best-effort auto-close for non-interactive sessions. Browsers block
+    // window.close() on tabs they opened directly (interactive approval), so the
+    // "Return to Claude" button and message above remain as the fallback.
+    setTimeout(function () { window.close() }, 400)
   </script>
 </body>
 </html>`)
