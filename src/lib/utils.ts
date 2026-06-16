@@ -788,6 +788,11 @@ export async function connectToRemoteServer(
           return connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy, recursionReasons)
         }
         debugLog('Silent re-auth: no sibling-refreshed token, falling back to browser flow')
+      } else if (typeof siblingAware.hasSiblingRefreshedToken !== 'function') {
+        // Non-NodeOAuthClientProvider provider (e.g. a test mock or alternate SDK):
+        // the concurrent-refresh recovery is unavailable, so we go straight to the
+        // interactive flow. Log it so a misconfiguration isn't silently masked.
+        debugLog('Silent re-auth: provider has no hasSiblingRefreshedToken(), interactive flow only')
       }
 
       // Initialize authentication on-demand
