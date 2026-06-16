@@ -939,9 +939,9 @@ export function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbackServe
       border-radius: 18px; padding: 40px 34px; text-align: center;
       box-shadow: 0 16px 48px rgba(76,29,149,0.14);
     }
-    .brandrow { display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 28px; }
-    .brandrow svg { width: 40px; height: 40px; display: block; }
-    .wordmark { font-size: 22px; font-weight: 700; letter-spacing: -0.02em; color: #18181b; }
+    .brandrow { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; margin-bottom: 26px; }
+    .brandrow svg { width: 56px; height: 56px; display: block; }
+    .wordmark { font-size: 20px; font-weight: 700; letter-spacing: -0.02em; color: #18181b; }
     h1 { font-size: 21px; font-weight: 600; margin: 0 0 10px; letter-spacing: -0.01em; }
     p { margin: 0; font-size: 15px; line-height: 1.55; }
     .btn {
@@ -969,13 +969,21 @@ export function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbackServe
     </div>
     <h1>Authorization complete</h1>
     <p>You're connected to SpeakUp. You can return to Claude and continue.</p>
-    <button class="btn" type="button" onclick="window.close()">Return to Claude</button>
+    <button class="btn" type="button" id="return-btn">Return to Claude</button>
     <p class="hint">If this tab doesn't close, you can close it manually.</p>
   </main>
   <script>
-    // Best-effort auto-close for non-interactive sessions. Browsers block
-    // window.close() on tabs they opened directly (interactive approval), so the
-    // "Return to Claude" button and message above remain as the fallback.
+    // The Claude desktop app registers the "claude://" URL scheme. Opening it
+    // brings the app back to the foreground (the reliable "return to Claude"),
+    // then we attempt to close this tab. Browsers block window.close() on tabs
+    // they opened directly, so the manual-close hint stays as the fallback.
+    function returnToClaude() {
+      try { window.location.href = 'claude://' } catch (e) {}
+      setTimeout(function () { window.close() }, 300)
+    }
+    document.getElementById('return-btn').addEventListener('click', returnToClaude)
+    // Best-effort auto-close for non-interactive sessions (no user gesture →
+    // don't trigger the scheme automatically, just try to close).
     setTimeout(function () { window.close() }, 400)
   </script>
 </body>
