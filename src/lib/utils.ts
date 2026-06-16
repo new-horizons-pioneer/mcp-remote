@@ -913,16 +913,63 @@ export function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbackServe
     log('Auth code received, resolving promise')
     authCompletedResolve(code)
 
-    res.send(`
-      Authorization successful!
-      You may close this window and return to the CLI.
-      <script>
-        // If this is a non-interactive session (no manual approval step was required) then
-        // this should automatically close the window. If not, this will have no effect and
-        // the user will see the message above.
-        window.close();
-      </script>
-    `)
+    res.set('Content-Type', 'text/html; charset=utf-8').send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SpeakUp — Authorization complete</title>
+  <style>
+    :root { color-scheme: light dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: radial-gradient(1200px 600px at 50% -10%, #f3e8ff 0%, #faf5ff 40%, #ffffff 100%);
+      color: #1f2937; padding: 24px;
+    }
+    @media (prefers-color-scheme: dark) {
+      body { background: radial-gradient(1200px 600px at 50% -10%, #2e1065 0%, #1e1b2e 45%, #0f0f17 100%); color: #e5e7eb; }
+      .card { background: #17151f; border-color: rgba(255,255,255,0.08); }
+      .hint { color: #9ca3af; }
+    }
+    .card {
+      width: 100%; max-width: 420px; background: #ffffff; border: 1px solid rgba(17,24,39,0.08);
+      border-radius: 16px; padding: 40px 32px; text-align: center;
+      box-shadow: 0 12px 40px rgba(76,29,149,0.12);
+    }
+    .badge {
+      width: 64px; height: 64px; margin: 0 auto 20px; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      background: linear-gradient(135deg, #7c3aed 0%, #a78bfa 100%);
+      box-shadow: 0 8px 24px rgba(124,58,237,0.35);
+    }
+    .badge svg { width: 32px; height: 32px; }
+    h1 { font-size: 20px; font-weight: 650; margin: 0 0 8px; letter-spacing: -0.01em; }
+    p { margin: 0; font-size: 15px; line-height: 1.5; }
+    .hint { margin-top: 14px; font-size: 13px; color: #6b7280; }
+    .brand { margin-top: 24px; font-size: 12px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #7c3aed; }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <div class="badge" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M20 6 9 17l-5-5" />
+      </svg>
+    </div>
+    <h1>Authorization complete</h1>
+    <p>You're connected to SpeakUp. You can close this window and return to Claude.</p>
+    <p class="hint">This tab should close automatically.</p>
+    <div class="brand">SpeakUp</div>
+  </main>
+  <script>
+    // Non-interactive sessions auto-close. If the browser blocks programmatic
+    // close (interactive approval happened here), the message above stays visible.
+    window.close()
+  </script>
+</body>
+</html>`)
 
     // Notify main flow that auth code is available
     options.events.emit('auth-code-received', code)
