@@ -933,12 +933,6 @@ export function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbackServe
       background: radial-gradient(1200px 600px at 50% -10%, #f3e8ff 0%, #faf5ff 40%, #ffffff 100%);
       color: #1f2937; padding: 24px;
     }
-    @media (prefers-color-scheme: dark) {
-      body { background: radial-gradient(1200px 600px at 50% -10%, #2e1065 0%, #1e1b2e 45%, #0f0f17 100%); color: #f3f4f6; }
-      .card { background: #17151f; border-color: rgba(255,255,255,0.08); }
-      .wordmark { color: #f3f4f6; }
-      .hint { color: #9ca3af; }
-    }
     .card {
       width: 100%; max-width: 440px; background: #ffffff; border: 1px solid rgba(17,24,39,0.08);
       border-radius: 18px; padding: 40px 34px; text-align: center;
@@ -957,6 +951,17 @@ export function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbackServe
     .btn:hover { background: #6d28d9; }
     .btn:active { transform: scale(0.98); }
     .hint { margin-top: 16px; font-size: 13px; color: #6b7280; }
+    /* Dark-theme overrides MUST stay last. Equal specificity means CSS
+       source order decides the winner, so these have to sit after the
+       base .card/.wordmark/.hint rules — otherwise the base rules
+       clobber them and dark mode renders a white card with near-white
+       (invisible) h1/p text. */
+    @media (prefers-color-scheme: dark) {
+      body { background: radial-gradient(1200px 600px at 50% -10%, #2e1065 0%, #1e1b2e 45%, #0f0f17 100%); color: #f3f4f6; }
+      .card { background: #17151f; border-color: rgba(255,255,255,0.08); }
+      .wordmark { color: #f3f4f6; }
+      .hint { color: #9ca3af; }
+    }
   </style>
 </head>
 <body>
