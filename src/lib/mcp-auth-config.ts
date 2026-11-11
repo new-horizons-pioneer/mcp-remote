@@ -149,8 +149,40 @@ export async function readJsonFile<T>(serverUrlHash: string, filename: string, s
       // console.log(`File ${filename} does not exist`)
       return undefined
     }
-    log(`Error reading ${filename}:`, error)
+    // Never log the error itself: V8's JSON.parse message quotes the file contents (tokens).
+    log(`Error reading ${filename}: ${describeFsError(error)}`)
     return undefined
+  }
+}
+
+/** name/code only — never message, which may quote file contents. */
+export function describeFsError(error: unknown): string {
+  const e = error as { name?: unknown; code?: unknown } | undefined
+  const name = typeof e?.name === 'string' ? e.name : 'Error'
+  return typeof e?.code === 'string' ? `${name} ${e.code}` : name
+}
+
+/**
+ * Like readJsonFile, but only a missing file yields `undefined`; any other failure
+ * (permissions, I/O, malformed JSON, schema mismatch) throws a sanitized error
+ * (no file contents). Used where "missing" and "unreadable" must not be conflated.
+ */
+export async function readJsonFileStrict<T>(serverUrlHash: string, filename: string, schema: any): Promise<T | undefined> {
+  await ensureConfigDir()
+  const filePath = getConfigFilePath(serverUrlHash, filename)
+  let content: string
+  try {
+    content = await fs.readFile(filePath, 'utf-8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    throw Object.assign(new Error(`Cannot read ${filename}: ${describeFsError(error)}`), {
+      code: (error as NodeJS.ErrnoException).code,
+    })
+  }
+  try {
+    return await schema.parseAsync(JSON.parse(content))
+  } catch (error) {
+    throw new Error(`Cannot parse ${filename}: ${describeFsError(error)}`)
   }
 }
 

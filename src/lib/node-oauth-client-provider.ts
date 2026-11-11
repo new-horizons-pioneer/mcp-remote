@@ -16,7 +16,11 @@ import { fetchAuthorizationServerMetadata, type AuthorizationServerMetadata } fr
 import type { ProtectedResourceMetadata } from './protected-resource-metadata'
 import {
   createRefreshCoordinatedFetch,
+  clearRejectedRefreshToken,
   isCoordinatorPersisted,
+  readTokensStrict,
+  rejectedRefreshTokenFor,
+  unpersistedSuccessorFor,
   withTokensLock,
   type FetchLike,
   type RefreshFetchOptions,
@@ -46,11 +50,6 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   // refreshed the token out from under us, so we can reuse its result instead of
   // opening a redundant interactive browser flow. See redirectToAuthorization().
   private lastReadAccessToken: string | undefined
-  // Refresh token most recently served via `tokens()`, and the last refresh token the
-  // server definitively rejected (invalid_grant). invalidateCredentials('tokens') only
-  // deletes tokens.json while it still holds one of these — never a sibling's newer pair.
-  private lastReadRefreshToken: string | undefined
-  private rejectedRefreshToken: string | undefined
   // Grace period to let a sibling's in-flight refresh land before we give up and
   // open a browser. Only applied to re-auth (never to a cold first authorization).
   private static readonly SIBLING_REFRESH_GRACE_MS = 400
@@ -234,9 +233,10 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     debugLog('Reading OAuth tokens')
     debugLog('Token request stack trace:', new Error().stack)
 
-    const tokens = await this.readPersistedTokens()
+    const persisted = await this.readPersistedTokens()
+    // A refreshed pair that could not be written to disk yet wins over its rotated predecessor.
+    const tokens = unpersistedSuccessorFor(this.serverUrlHash, persisted) ?? persisted
     this.lastReadAccessToken = tokens?.access_token
-    this.lastReadRefreshToken = tokens?.refresh_token
 
     if (tokens) {
       const timeLeft = tokens.expires_in || 0
@@ -296,7 +296,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     }
 
     await withTokensLock(this.serverUrlHash, () => writeJsonFile(this.serverUrlHash, 'tokens.json', tokens))
-    this.rejectedRefreshToken = undefined
+    clearRejectedRefreshToken(this.serverUrlHash)
   }
 
   /**
@@ -305,11 +305,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    * tokens.json, retried on transient failures, and persisted atomically. See token-refresh.ts.
    */
   wrapFetch(baseFetch: FetchLike, options?: RefreshFetchOptions): FetchLike {
-    return createRefreshCoordinatedFetch(this.serverUrlHash, baseFetch, options, {
-      onRefreshTokenRejected: (refreshToken) => {
-        this.rejectedRefreshToken = refreshToken
-      },
-    })
+    return createRefreshCoordinatedFetch(this.serverUrlHash, baseFetch, options)
   }
 
   /**
@@ -417,14 +413,22 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
         break
 
       case 'tokens': {
-        // The SDK calls this after any invalid_grant. Only delete what we know is bad: if a
-        // sibling process has meanwhile persisted a different refresh token, keep it.
-        const knownBad = this.rejectedRefreshToken ?? this.lastReadRefreshToken
+        // The SDK calls this after any invalid_grant. Fail closed: delete only when tokens.json
+        // is absent (idempotent) or still holds the RT the server rejected for this server hash
+        // (recorded by the refresh coordinator, shared by every provider in this process).
+        // Unknown rejected RT, a sibling's newer pair, or an unreadable file → keep it.
+        const rejected = rejectedRefreshTokenFor(this.serverUrlHash)
         await withTokensLock(this.serverUrlHash, async () => {
-          const onDisk = await this.readPersistedTokens()
-          if (onDisk?.refresh_token && knownBad && onDisk.refresh_token !== knownBad) {
-            log('Keeping tokens.json: it holds a newer refresh token than the one that was rejected.')
-            debugLog('invalidateCredentials(tokens): newer tokens on disk, not deleting')
+          let onDisk: OAuthTokens | undefined
+          try {
+            onDisk = await readTokensStrict(this.serverUrlHash)
+          } catch {
+            log('Keeping tokens.json: it is unreadable, so it is not known to hold the rejected token.')
+            return
+          }
+          if (onDisk && !(rejected && onDisk.refresh_token === rejected)) {
+            log('Keeping tokens.json: it does not hold a refresh token known to be rejected.')
+            debugLog('invalidateCredentials(tokens): not deleting', { hasRejected: !!rejected })
             return
           }
           await deleteConfigFile(this.serverUrlHash, 'tokens.json')
