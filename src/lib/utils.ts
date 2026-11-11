@@ -676,6 +676,11 @@ export async function connectToRemoteServer(
     },
   }
 
+  // Route the SDK's token requests through the provider's refresh coordinator (single-flight,
+  // cross-process lock, retry on transient errors) when the provider offers one.
+  const refreshAware = authProvider as Partial<{ wrapFetch: (base: typeof globalThis.fetch) => typeof globalThis.fetch }>
+  const transportFetch = typeof refreshAware.wrapFetch === 'function' ? refreshAware.wrapFetch(globalThis.fetch) : undefined
+
   log(`Using transport strategy: ${transportStrategy}`)
   // Determine if we should attempt to fallback on error
   // Choose transport based on user strategy and recursion history
@@ -688,10 +693,12 @@ export async function connectToRemoteServer(
         authProvider,
         requestInit: { headers },
         eventSourceInit,
+        fetch: transportFetch,
       })
     : new StreamableHTTPClientTransport(url, {
         authProvider,
         requestInit: { headers },
+        fetch: transportFetch,
       })
 
   try {
@@ -709,7 +716,11 @@ export async function connectToRemoteServer(
         // the client is already connected. So let's just create a one-off client to make a single request and figure
         // out if we're actually talking to an HTTP server or not.
         debugLog('Creating test transport for HTTP-only connection test')
-        const testTransport = new StreamableHTTPClientTransport(url, { authProvider, requestInit: { headers } })
+        const testTransport = new StreamableHTTPClientTransport(url, {
+          authProvider,
+          requestInit: { headers },
+          fetch: transportFetch,
+        })
         const testClient = new Client({ name: 'mcp-remote-fallback-test', version: '0.0.0' }, { capabilities: {} })
         await testClient.connect(testTransport)
       }

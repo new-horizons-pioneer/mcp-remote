@@ -14,6 +14,13 @@ import { sanitizeUrl } from 'strict-url-sanitise'
 import { randomUUID } from 'node:crypto'
 import { fetchAuthorizationServerMetadata, type AuthorizationServerMetadata } from './authorization-server-metadata'
 import type { ProtectedResourceMetadata } from './protected-resource-metadata'
+import {
+  createRefreshCoordinatedFetch,
+  isCoordinatorPersisted,
+  withTokensLock,
+  type FetchLike,
+  type RefreshFetchOptions,
+} from './token-refresh'
 
 /**
  * Implements the OAuthClientProvider interface for Node.js environments.
@@ -39,6 +46,11 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   // refreshed the token out from under us, so we can reuse its result instead of
   // opening a redundant interactive browser flow. See redirectToAuthorization().
   private lastReadAccessToken: string | undefined
+  // Refresh token most recently served via `tokens()`, and the last refresh token the
+  // server definitively rejected (invalid_grant). invalidateCredentials('tokens') only
+  // deletes tokens.json while it still holds one of these — never a sibling's newer pair.
+  private lastReadRefreshToken: string | undefined
+  private rejectedRefreshToken: string | undefined
   // Grace period to let a sibling's in-flight refresh land before we give up and
   // open a browser. Only applied to re-auth (never to a cold first authorization).
   private static readonly SIBLING_REFRESH_GRACE_MS = 400
@@ -224,6 +236,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
 
     const tokens = await this.readPersistedTokens()
     this.lastReadAccessToken = tokens?.access_token
+    this.lastReadRefreshToken = tokens?.refresh_token
 
     if (tokens) {
       const timeLeft = tokens.expires_in || 0
@@ -275,7 +288,28 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       expiresInValue: tokens.expires_in,
     })
 
-    await writeJsonFile(this.serverUrlHash, 'tokens.json', tokens)
+    if (isCoordinatorPersisted(this.serverUrlHash, tokens)) {
+      // The SDK echoing a refresh result the coordinator already persisted under the lock.
+      // Re-writing it now (outside the lock) could clobber a newer rotation by a sibling.
+      debugLog('Tokens already persisted by refresh coordinator; skipping duplicate write')
+      return
+    }
+
+    await withTokensLock(this.serverUrlHash, () => writeJsonFile(this.serverUrlHash, 'tokens.json', tokens))
+    this.rejectedRefreshToken = undefined
+  }
+
+  /**
+   * Wraps the fetch handed to the SDK transports so that every refresh_token grant is
+   * single-flighted in-process, serialized across mcp-remote processes via a lock next to
+   * tokens.json, retried on transient failures, and persisted atomically. See token-refresh.ts.
+   */
+  wrapFetch(baseFetch: FetchLike, options?: RefreshFetchOptions): FetchLike {
+    return createRefreshCoordinatedFetch(this.serverUrlHash, baseFetch, options, {
+      onRefreshTokenRejected: (refreshToken) => {
+        this.rejectedRefreshToken = refreshToken
+      },
+    })
   }
 
   /**
@@ -382,10 +416,22 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
         debugLog('Client information invalidated')
         break
 
-      case 'tokens':
-        await deleteConfigFile(this.serverUrlHash, 'tokens.json')
-        debugLog('OAuth tokens invalidated')
+      case 'tokens': {
+        // The SDK calls this after any invalid_grant. Only delete what we know is bad: if a
+        // sibling process has meanwhile persisted a different refresh token, keep it.
+        const knownBad = this.rejectedRefreshToken ?? this.lastReadRefreshToken
+        await withTokensLock(this.serverUrlHash, async () => {
+          const onDisk = await this.readPersistedTokens()
+          if (onDisk?.refresh_token && knownBad && onDisk.refresh_token !== knownBad) {
+            log('Keeping tokens.json: it holds a newer refresh token than the one that was rejected.')
+            debugLog('invalidateCredentials(tokens): newer tokens on disk, not deleting')
+            return
+          }
+          await deleteConfigFile(this.serverUrlHash, 'tokens.json')
+          debugLog('OAuth tokens invalidated')
+        })
         break
+      }
 
       case 'verifier':
         await deleteConfigFile(this.serverUrlHash, 'code_verifier.txt')
