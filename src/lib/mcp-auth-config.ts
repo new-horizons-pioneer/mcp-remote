@@ -149,13 +149,45 @@ export async function readJsonFile<T>(serverUrlHash: string, filename: string, s
       // console.log(`File ${filename} does not exist`)
       return undefined
     }
-    log(`Error reading ${filename}:`, error)
+    // Never log the error itself: V8's JSON.parse message quotes the file contents (tokens).
+    log(`Error reading ${filename}: ${describeFsError(error)}`)
     return undefined
   }
 }
 
+/** name/code only — never message, which may quote file contents. */
+export function describeFsError(error: unknown): string {
+  const e = error as { name?: unknown; code?: unknown } | undefined
+  const name = typeof e?.name === 'string' ? e.name : 'Error'
+  return typeof e?.code === 'string' ? `${name} ${e.code}` : name
+}
+
 /**
- * Writes a JSON object to a file
+ * Like readJsonFile, but only a missing file yields `undefined`; any other failure
+ * (permissions, I/O, malformed JSON, schema mismatch) throws a sanitized error
+ * (no file contents). Used where "missing" and "unreadable" must not be conflated.
+ */
+export async function readJsonFileStrict<T>(serverUrlHash: string, filename: string, schema: any): Promise<T | undefined> {
+  await ensureConfigDir()
+  const filePath = getConfigFilePath(serverUrlHash, filename)
+  let content: string
+  try {
+    content = await fs.readFile(filePath, 'utf-8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    throw Object.assign(new Error(`Cannot read ${filename}: ${describeFsError(error)}`), {
+      code: (error as NodeJS.ErrnoException).code,
+    })
+  }
+  try {
+    return await schema.parseAsync(JSON.parse(content))
+  } catch (error) {
+    throw new Error(`Cannot parse ${filename}: ${describeFsError(error)}`)
+  }
+}
+
+/**
+ * Writes a JSON object to a file atomically (temp file + rename)
  * @param serverUrlHash The hash of the server URL
  * @param filename The name of the file to write
  * @param data The data to write
@@ -164,7 +196,15 @@ export async function writeJsonFile(serverUrlHash: string, filename: string, dat
   try {
     await ensureConfigDir()
     const filePath = getConfigFilePath(serverUrlHash, filename)
-    await fs.writeFile(filePath, JSON.stringify(data, null, 2), { encoding: 'utf-8', mode: 0o600 })
+    // Atomic: readers in sibling processes never observe a truncated / half-written file.
+    const tmpPath = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`
+    try {
+      await fs.writeFile(tmpPath, JSON.stringify(data, null, 2), { encoding: 'utf-8', mode: 0o600 })
+      await fs.rename(tmpPath, filePath)
+    } catch (error) {
+      await fs.unlink(tmpPath).catch(() => {})
+      throw error
+    }
   } catch (error) {
     log(`Error writing ${filename}:`, error)
     throw error

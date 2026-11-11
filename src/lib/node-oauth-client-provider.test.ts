@@ -6,6 +6,7 @@ import type { OAuthProviderOptions } from './types'
 import type { AuthorizationServerMetadata } from './authorization-server-metadata'
 
 vi.mock('./mcp-auth-config')
+vi.mock('proper-lockfile', () => ({ default: { lock: vi.fn(async () => async () => {}) } }))
 vi.mock('./authorization-server-metadata', () => ({
   fetchAuthorizationServerMetadata: vi.fn().mockResolvedValue(undefined),
 }))
@@ -23,6 +24,7 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
   let mockReadJsonFile: any
   let mockWriteJsonFile: any
   let mockDeleteConfigFile: any
+  let mockReadJsonFileStrict: any
 
   const defaultOptions: OAuthProviderOptions = {
     serverUrl: 'https://example.com',
@@ -35,6 +37,8 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
     mockReadJsonFile = vi.mocked(mcpAuthConfig.readJsonFile)
     mockWriteJsonFile = vi.mocked(mcpAuthConfig.writeJsonFile)
     mockDeleteConfigFile = vi.mocked(mcpAuthConfig.deleteConfigFile)
+    mockReadJsonFileStrict = vi.mocked(mcpAuthConfig.readJsonFileStrict)
+    mockReadJsonFileStrict.mockResolvedValue(undefined)
 
     mockReadJsonFile.mockResolvedValue(undefined)
     mockWriteJsonFile.mockResolvedValue(undefined)
@@ -310,7 +314,7 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
 
     it('hasSiblingRefreshedToken is false before any token has been served', async () => {
       provider = new NodeOAuthClientProvider(defaultOptions)
-      mockReadJsonFile.mockResolvedValue(tokenB)
+      mockReadJsonFileStrict.mockResolvedValue(tokenB)
 
       // Never called tokens() yet → no baseline → cannot be a sibling race
       expect(await provider.hasSiblingRefreshedToken()).toBe(false)
@@ -319,39 +323,39 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
     it('hasSiblingRefreshedToken is true when disk token differs from last served', async () => {
       provider = new NodeOAuthClientProvider(defaultOptions)
 
-      mockReadJsonFile.mockResolvedValueOnce(tokenA) // served to a transport
+      mockReadJsonFileStrict.mockResolvedValueOnce(tokenA) // served to a transport
       await provider.tokens()
 
-      mockReadJsonFile.mockResolvedValueOnce(tokenB) // a sibling refreshed
+      mockReadJsonFileStrict.mockResolvedValueOnce(tokenB) // a sibling refreshed
       expect(await provider.hasSiblingRefreshedToken()).toBe(true)
     })
 
     it('hasSiblingRefreshedToken is false when disk token is unchanged', async () => {
       provider = new NodeOAuthClientProvider(defaultOptions)
 
-      mockReadJsonFile.mockResolvedValueOnce(tokenA)
+      mockReadJsonFileStrict.mockResolvedValueOnce(tokenA)
       await provider.tokens()
 
-      mockReadJsonFile.mockResolvedValueOnce(tokenA) // nothing changed
+      mockReadJsonFileStrict.mockResolvedValueOnce(tokenA) // nothing changed
       expect(await provider.hasSiblingRefreshedToken()).toBe(false)
     })
 
     it('tokens() does not clobber the baseline used by the guard', async () => {
       provider = new NodeOAuthClientProvider(defaultOptions)
 
-      mockReadJsonFile.mockResolvedValueOnce(tokenA)
+      mockReadJsonFileStrict.mockResolvedValueOnce(tokenA)
       await provider.tokens()
 
       // Two consecutive guard checks must both see the sibling token without the
       // first check mutating the baseline.
-      mockReadJsonFile.mockResolvedValue(tokenB)
+      mockReadJsonFileStrict.mockResolvedValue(tokenB)
       expect(await provider.hasSiblingRefreshedToken()).toBe(true)
       expect(await provider.hasSiblingRefreshedToken()).toBe(true)
     })
 
     it('redirectToAuthorization opens a browser on a cold first authorization', async () => {
       provider = new NodeOAuthClientProvider(defaultOptions)
-      mockReadJsonFile.mockResolvedValue(undefined) // no token ever
+      mockReadJsonFileStrict.mockResolvedValue(undefined) // no token ever
 
       await provider.redirectToAuthorization(new URL('https://auth.example.com/authorize'))
 
@@ -361,10 +365,10 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
     it('redirectToAuthorization skips the browser when a sibling already refreshed', async () => {
       provider = new NodeOAuthClientProvider(defaultOptions)
 
-      mockReadJsonFile.mockResolvedValueOnce(tokenA) // served to a transport
+      mockReadJsonFileStrict.mockResolvedValueOnce(tokenA) // served to a transport
       await provider.tokens()
 
-      mockReadJsonFile.mockResolvedValue(tokenB) // sibling refreshed
+      mockReadJsonFileStrict.mockResolvedValue(tokenB) // sibling refreshed
       await provider.redirectToAuthorization(new URL('https://auth.example.com/authorize'))
 
       expect(openBrowser).not.toHaveBeenCalled()
@@ -373,10 +377,10 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
     it('redirectToAuthorization still opens the browser when no sibling refreshed', async () => {
       provider = new NodeOAuthClientProvider(defaultOptions)
 
-      mockReadJsonFile.mockResolvedValueOnce(tokenA)
+      mockReadJsonFileStrict.mockResolvedValueOnce(tokenA)
       await provider.tokens()
 
-      mockReadJsonFile.mockResolvedValue(tokenA) // unchanged → genuine re-auth
+      mockReadJsonFileStrict.mockResolvedValue(tokenA) // unchanged → genuine re-auth
       await provider.redirectToAuthorization(new URL('https://auth.example.com/authorize'))
 
       expect(openBrowser).toHaveBeenCalledTimes(1)

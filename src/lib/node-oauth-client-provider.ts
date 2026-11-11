@@ -1,11 +1,6 @@
 import open from 'open'
 import { OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js'
-import {
-  OAuthClientInformationFull,
-  OAuthClientInformationFullSchema,
-  OAuthTokens,
-  OAuthTokensSchema,
-} from '@modelcontextprotocol/sdk/shared/auth.js'
+import { OAuthClientInformationFull, OAuthClientInformationFullSchema, OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js'
 import type { OAuthProviderOptions, StaticOAuthClientMetadata } from './types'
 import { readJsonFile, writeJsonFile, readTextFile, writeTextFile, deleteConfigFile } from './mcp-auth-config'
 import { StaticOAuthClientInformationFull } from './types'
@@ -14,6 +9,18 @@ import { sanitizeUrl } from 'strict-url-sanitise'
 import { randomUUID } from 'node:crypto'
 import { fetchAuthorizationServerMetadata, type AuthorizationServerMetadata } from './authorization-server-metadata'
 import type { ProtectedResourceMetadata } from './protected-resource-metadata'
+import {
+  createRefreshCoordinatedFetch,
+  clearRejectedRefreshToken,
+  isCoordinatorPersisted,
+  readTokensOrUnavailable,
+  readTokensStrict,
+  rejectedRefreshTokenFor,
+  unpersistedSuccessorFor,
+  withTokensLock,
+  type FetchLike,
+  type RefreshFetchOptions,
+} from './token-refresh'
 
 /**
  * Implements the OAuthClientProvider interface for Node.js environments.
@@ -201,9 +208,11 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    * Reads the persisted tokens from disk WITHOUT mutating `lastReadAccessToken`.
    * Used by the concurrent-refresh guards so their bookkeeping reads don't
    * clobber the "token we last served to a transport" signal.
+   * Strict: a missing file is `undefined`, an unreadable one throws TemporarilyUnavailableError
+   * (never mistaken for "no tokens", which would send the SDK into a browser flow).
    */
   private async readPersistedTokens(): Promise<OAuthTokens | undefined> {
-    return readJsonFile<OAuthTokens>(this.serverUrlHash, 'tokens.json', OAuthTokensSchema)
+    return readTokensOrUnavailable(this.serverUrlHash)
   }
 
   /**
@@ -222,7 +231,9 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     debugLog('Reading OAuth tokens')
     debugLog('Token request stack trace:', new Error().stack)
 
-    const tokens = await this.readPersistedTokens()
+    const persisted = await this.readPersistedTokens()
+    // A refreshed pair that could not be written to disk yet wins over its rotated predecessor.
+    const tokens = unpersistedSuccessorFor(this.serverUrlHash, persisted) ?? persisted
     this.lastReadAccessToken = tokens?.access_token
 
     if (tokens) {
@@ -275,7 +286,28 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       expiresInValue: tokens.expires_in,
     })
 
-    await writeJsonFile(this.serverUrlHash, 'tokens.json', tokens)
+    if (isCoordinatorPersisted(this.serverUrlHash, tokens)) {
+      // The SDK echoing a refresh result the coordinator already persisted under the lock.
+      // Re-writing it now (outside the lock) could clobber a newer rotation by a sibling.
+      debugLog('Tokens already persisted by refresh coordinator; skipping duplicate write')
+      return
+    }
+
+    // A fresh login result is worth more than the race the lock guards against: if the lock is
+    // unavailable, write (atomically) anyway.
+    await withTokensLock(this.serverUrlHash, () => writeJsonFile(this.serverUrlHash, 'tokens.json', tokens), {
+      onUnavailable: 'run-unlocked',
+    })
+    clearRejectedRefreshToken(this.serverUrlHash)
+  }
+
+  /**
+   * Wraps the fetch handed to the SDK transports so that every refresh_token grant is
+   * single-flighted in-process, serialized across mcp-remote processes via a lock next to
+   * tokens.json, retried on transient failures, and persisted atomically. See token-refresh.ts.
+   */
+  wrapFetch(baseFetch: FetchLike, options?: RefreshFetchOptions): FetchLike {
+    return createRefreshCoordinatedFetch(this.serverUrlHash, baseFetch, options)
   }
 
   /**
@@ -382,10 +414,30 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
         debugLog('Client information invalidated')
         break
 
-      case 'tokens':
-        await deleteConfigFile(this.serverUrlHash, 'tokens.json')
-        debugLog('OAuth tokens invalidated')
+      case 'tokens': {
+        // The SDK calls this after any invalid_grant. Fail closed: delete only when tokens.json
+        // is absent (idempotent) or still holds the RT the server rejected for this server hash
+        // (recorded by the refresh coordinator, shared by every provider in this process).
+        // Unknown rejected RT, a sibling's newer pair, or an unreadable file → keep it.
+        const rejected = rejectedRefreshTokenFor(this.serverUrlHash)
+        await withTokensLock(this.serverUrlHash, async () => {
+          let onDisk: OAuthTokens | undefined
+          try {
+            onDisk = await readTokensStrict(this.serverUrlHash)
+          } catch {
+            log('Keeping tokens.json: it is unreadable, so it is not known to hold the rejected token.')
+            return
+          }
+          if (onDisk && !(rejected && onDisk.refresh_token === rejected)) {
+            log('Keeping tokens.json: it does not hold a refresh token known to be rejected.')
+            debugLog('invalidateCredentials(tokens): not deleting', { hasRejected: !!rejected })
+            return
+          }
+          await deleteConfigFile(this.serverUrlHash, 'tokens.json')
+          debugLog('OAuth tokens invalidated')
+        })
         break
+      }
 
       case 'verifier':
         await deleteConfigFile(this.serverUrlHash, 'code_verifier.txt')
