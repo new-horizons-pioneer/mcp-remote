@@ -23,9 +23,11 @@ import { debugLog, log } from './utils'
  *     unreadable tokens.json all fail closed (TemporarilyUnavailableError, nothing sent);
  *  3. invalid_grant deletes tokens.json only if it still holds the RT that was sent;
  *  4. network errors / timeouts / 5xx / non-OAuth bodies are retried with backoff. Every send of
- *     one RT — across all flights in this process — happens within MAX_REFRESH_RETRY_WINDOW_MS of
- *     its first possibly-delivered send (< the 60s server grace). Failures surface as
- *     TemporarilyUnavailableError, which the SDK re-throws instead of opening a browser;
+ *     one RT — by any flight in any mcp-remote process — happens within MAX_REFRESH_RETRY_WINDOW_MS
+ *     of its first possibly-delivered send (< the 60s server grace). The window start is kept in
+ *     memory and in `<hash>_refresh_windows.json` (read/written only under the lock, atomic, an
+ *     unreadable file fails closed). Failures surface as TemporarilyUnavailableError, which the
+ *     SDK re-throws instead of opening a browser;
  *  5. the successor is persisted atomically (temp + rename, retried) before anyone uses it.
  *
  * Residual risk: if persisting the successor fails on every retry (disk broken), it is kept in
@@ -77,6 +79,9 @@ export function refreshRetryWindowMs(options: RefreshFetchOptions): number {
 
 const PERSIST_ATTEMPTS = 3
 const MAX_TRACKED_WINDOWS = 1_000
+const WINDOWS_FILENAME = 'refresh_windows.json'
+/** Sidecar entries for RTs that never rotated are dropped after a day. */
+const WINDOW_ENTRY_TTL_MS = 24 * 60 * 60 * 1000
 
 /** OAuth error codes that mean "try again later", not "your grant is bad". */
 const TRANSIENT_OAUTH_ERRORS = new Set(['server_error', 'temporarily_unavailable'])
@@ -204,9 +209,12 @@ export async function withTokensLock<T>(
   try {
     return await Promise.race([fn(controller.signal), compromised])
   } finally {
-    if (!controller.signal.aborted) {
-      await release().catch((error) => log(`Could not release tokens lock (${describeFsError(error)})`))
-    }
+    // After a compromise proper-lockfile has already marked the lock released, so release()
+    // only rejects with ERELEASED and touches nothing on disk.
+    const lockLost = controller.signal.aborted
+    await release().catch((error) => {
+      if (!lockLost) log(`Could not release tokens lock (${describeFsError(error)})`)
+    })
   }
 }
 
@@ -336,14 +344,42 @@ async function persistTokens(
   throw new TemporarilyUnavailableError('Refreshed tokens could not be persisted to disk')
 }
 
-function openRetryWindow(rtKey: string, now: number): boolean {
-  if (rtWindowOpenedAt.has(rtKey)) return false
+function rememberWindow(rtKey: string, openedAt: number): void {
+  if (rtWindowOpenedAt.has(rtKey)) return
   if (rtWindowOpenedAt.size >= MAX_TRACKED_WINDOWS) {
     const oldest = rtWindowOpenedAt.keys().next().value
     if (oldest !== undefined) rtWindowOpenedAt.delete(oldest)
   }
-  rtWindowOpenedAt.set(rtKey, now)
-  return true
+  rtWindowOpenedAt.set(rtKey, openedAt)
+}
+
+type RetryWindows = Record<string, number> // sha256(rt) → first possibly-delivered send (ms)
+
+const retryWindowsSchema = {
+  async parseAsync(data: unknown): Promise<RetryWindows> {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) throw new TypeError('not an object')
+    for (const value of Object.values(data)) {
+      if (typeof value !== 'number' || !Number.isFinite(value)) throw new TypeError('not a timestamp')
+    }
+    return data as RetryWindows
+  },
+}
+
+/** Cross-process retry windows. Call only under the tokens lock. Unreadable → fail closed. */
+async function readRetryWindows(serverUrlHash: string): Promise<RetryWindows> {
+  try {
+    return (await readJsonFileStrict<RetryWindows>(serverUrlHash, WINDOWS_FILENAME, retryWindowsSchema)) ?? {}
+  } catch (error) {
+    log(`${WINDOWS_FILENAME} is unreadable (${describeFsError(error)}); not refreshing.`)
+    throw new TemporarilyUnavailableError('refresh retry-window record is unreadable')
+  }
+}
+
+/** Atomic write of the windows sidecar (expired entries dropped). Call only under the tokens lock. */
+async function writeRetryWindows(serverUrlHash: string, windows: RetryWindows): Promise<void> {
+  const now = Date.now()
+  const kept = Object.fromEntries(Object.entries(windows).filter(([, at]) => now - at < WINDOW_ENTRY_TTL_MS))
+  await writeJsonFile(serverUrlHash, WINDOWS_FILENAME, kept)
 }
 
 async function coordinatedRefresh(
@@ -378,20 +414,35 @@ async function coordinatedRefresh(
       }
 
       const windowMs = refreshRetryWindowMs(opts)
-      const rtKey = `${serverUrlHash}\0${sha(sentRefreshToken)}`
+      const rtSha = sha(sentRefreshToken)
+      const rtKey = `${serverUrlHash}\0${rtSha}`
+      // Read before any send: a sibling process may already have opened (and exhausted) this RT's window.
+      let windows = await readRetryWindows(serverUrlHash)
       let lastError: unknown
       for (let attempt = 1; attempt <= opts.maxAttempts; attempt++) {
         if (lockSignal.aborted) throw lockSignal.reason
         const now = Date.now()
-        // Process-wide: every send of this RT starts and finishes inside the window opened by its
-        // first possibly-delivered send, whichever flight made it (server grace is 60s).
-        const openedAt = rtWindowOpenedAt.get(rtKey)
+        // Every send of this RT starts and finishes inside the window opened by its first
+        // possibly-delivered send, by any flight in any process (server grace is 60s).
+        const known = [rtWindowOpenedAt.get(rtKey), windows[rtSha]].filter((at): at is number => at !== undefined)
+        const openedAt = known.length ? Math.min(...known) : undefined
         const remaining = openedAt === undefined ? windowMs : openedAt + windowMs - now
         if (remaining <= 0) {
           lastError ??= new Error('retry window for this refresh token has closed')
           break
         }
-        const openedHere = openRetryWindow(rtKey, now)
+        const openedHere = openedAt === undefined
+        if (openedHere) {
+          // Record the window on disk BEFORE sending, so no other process can resend this RT later.
+          windows = { ...windows, [rtSha]: now }
+          try {
+            await writeRetryWindows(serverUrlHash, windows)
+          } catch (error) {
+            log(`Could not record the refresh retry window (${describeFsError(error)}); not refreshing.`)
+            throw new TemporarilyUnavailableError('could not record the refresh retry window')
+          }
+        }
+        rememberWindow(rtKey, openedAt ?? now)
         let result: Attempt
         try {
           result = await attemptRefresh(baseFetch, url, init, sentRefreshToken, Math.min(opts.attemptTimeoutMs, remaining), lockSignal)
@@ -399,13 +450,19 @@ async function coordinatedRefresh(
           if (lockSignal.aborted) throw lockSignal.reason
           lastError = error
           // The request never left this machine: the server cannot have seen this RT yet.
-          if (openedHere && wasNeverDelivered(error)) rtWindowOpenedAt.delete(rtKey)
+          if (openedHere && wasNeverDelivered(error)) {
+            rtWindowOpenedAt.delete(rtKey)
+            const { [rtSha]: _closed, ...rest } = windows
+            windows = rest
+            // Best effort: if this write fails the entry stays, which is the conservative direction.
+            await writeRetryWindows(serverUrlHash, windows).catch(() => {})
+          }
           debugLog(`Token refresh attempt ${attempt}/${opts.maxAttempts} failed transiently`, {
             error: (error as Error)?.message,
           })
           if (attempt < opts.maxAttempts) {
             const delay = opts.retryBaseDelayMs * 2 ** (attempt - 1)
-            const opened = rtWindowOpenedAt.get(rtKey)
+            const opened = rtWindowOpenedAt.get(rtKey) ?? windows[rtSha]
             if (opened !== undefined && Date.now() + delay >= opened + windowMs) break
             await sleep(delay)
           }
@@ -413,8 +470,18 @@ async function coordinatedRefresh(
         }
 
         if (result.kind === 'ok') {
+          if (lockSignal.aborted) {
+            // Lost the lock while the response was in flight: writing now could clobber whoever
+            // holds it. Keep the successor in this process's memory (served by tokens(), persisted
+            // by this process's next refresh) and fail this flight.
+            unpersisted.set(serverUrlHash, { tokens: result.tokens, predecessor: sentRefreshToken })
+            throw lockSignal.reason
+          }
           // Persist (atomically) before anyone gets to use the successor.
           await persistTokens(serverUrlHash, result.tokens, sentRefreshToken, opts)
+          // The RT is rotated; its window entry is no longer needed (best effort).
+          const { [rtSha]: _rotated, ...rest } = windows
+          await writeRetryWindows(serverUrlHash, rest).catch(() => {})
           return tokensSnapshot(serverUrlHash, result.tokens)
         }
 

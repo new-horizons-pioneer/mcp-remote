@@ -606,3 +606,74 @@ describe('reading and invalidating tokens.json', () => {
     expect(await readTokens()).toBeUndefined()
   })
 })
+
+describe('retry window shared across processes (sidecar next to tokens.json)', () => {
+  const sidecar = () => getConfigFilePath(HASH, 'refresh_windows.json')
+  const opts = { maxAttempts: 5, attemptTimeoutMs: 150, retryBaseDelayMs: 10, retryWindowMs: 300 }
+  /** A fresh module instance has empty in-memory state — i.e. another mcp-remote process. */
+  async function otherProcess() {
+    vi.resetModules()
+    return (await import('./token-refresh')) as typeof tokenRefresh
+  }
+
+  it('process B does not resend an RT whose window process A opened and that has since closed', async () => {
+    const server = fakeServer(() => never())
+    await expect(wrapped(newProvider(), server.fetchFn, opts)(TOKEN_URL, refreshInit('rt-0'))).rejects.toThrow()
+    const sentByA = server.refreshCalls.length
+    expect(sentByA).toBeGreaterThan(0)
+    await sleep(350)
+
+    const b = await otherProcess()
+    const err = await b
+      .createRefreshCoordinatedFetch(
+        HASH,
+        server.fetchFn,
+        opts,
+      )(TOKEN_URL, refreshInit('rt-0'))
+      .catch((e) => e)
+
+    expect(err?.constructor?.name).toBe('TemporarilyUnavailableError')
+    expect(server.refreshCalls.length).toBe(sentByA)
+  })
+
+  it('a corrupt sidecar fails closed: no send, tokens kept', async () => {
+    await fs.writeFile(sidecar(), '{ not json')
+    const server = fakeServer(() => json(200, tokensFor('rt-1')))
+
+    const err = await wrapped(newProvider(), server.fetchFn)(TOKEN_URL, refreshInit('rt-0')).catch((e) => e)
+
+    expect(err?.constructor?.name).toBe('TemporarilyUnavailableError')
+    expect(server.refreshCalls).toEqual([])
+    expect((await readTokens())?.refresh_token).toBe('rt-0')
+  })
+
+  it('a successful rotation clears the RT entry from the sidecar', async () => {
+    const server = fakeServer((_p, call) => {
+      if (call < 2) throw new TypeError('fetch failed')
+      return json(200, tokensFor('rt-1'))
+    })
+
+    const res = await wrapped(newProvider(), server.fetchFn)(TOKEN_URL, refreshInit('rt-0'))
+
+    expect(res.status).toBe(200)
+    const windows = JSON.parse(await fs.readFile(sidecar(), 'utf-8').catch(() => '{}'))
+    expect(Object.keys(windows)).toEqual([])
+  })
+})
+
+describe('lock compromised while the successor is in flight', () => {
+  it('does not persist the successor after the lock was lost', async () => {
+    const base: FetchLike = async () => {
+      await sleep(1_600) // ignores its abort signal
+      return json(200, tokensFor('rt-1', 'at-1'))
+    }
+    const fetchFn = wrapped(newProvider(), base, { lockStaleMs: 2_000, lockUpdateMs: 1_000, attemptTimeoutMs: 5_000 })
+    const pending = fetchFn(TOKEN_URL, refreshInit('rt-0')).catch((e) => e)
+    await sleep(200)
+    await fs.rm(lockDir(), { recursive: true, force: true })
+
+    expect((await pending)?.constructor?.name).toBe('TemporarilyUnavailableError')
+    await sleep(1_800) // let the abandoned flight finish
+    expect((await readTokens())?.refresh_token).toBe('rt-0')
+  }, 8_000)
+})
