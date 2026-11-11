@@ -1,5 +1,5 @@
-import fs from 'fs/promises'
-import { randomUUID } from 'node:crypto'
+import { createHash } from 'node:crypto'
+import lockfile from 'proper-lockfile'
 import { OAuthTokens, OAuthTokensSchema } from '@modelcontextprotocol/sdk/shared/auth.js'
 import { TemporarilyUnavailableError } from '@modelcontextprotocol/sdk/server/auth/errors.js'
 import { deleteConfigFile, describeFsError, ensureConfigDir, getConfigFilePath, readJsonFileStrict, writeJsonFile } from './mcp-auth-config'
@@ -15,23 +15,28 @@ import { debugLog, log } from './utils'
  * already-rotated RT — revoke the whole chain and force a browser login. Incident 2026-11-05.
  *
  * Every refresh_token grant therefore goes through `createRefreshCoordinatedFetch`:
- *  1. in-process single-flight per server hash (one network refresh, result shared; a caller's
- *     abort only detaches that caller);
- *  2. cross-process lock next to tokens.json; under it tokens.json is RE-READ and, if another
- *     process already rotated, its tokens are used and no refresh is sent. An unreadable
- *     tokens.json blocks the refresh (never treated as "missing");
+ *  1. in-process single-flight per (server hash, RT): one network refresh, result shared; a
+ *     caller's abort only detaches that caller;
+ *  2. cross-process lock on tokens.json (proper-lockfile: mkdir lock + heartbeat + stale
+ *     takeover). Under it tokens.json is RE-READ and, if another process already rotated, its
+ *     tokens are used and no refresh is sent. Failing to get the lock, a compromised lock, or an
+ *     unreadable tokens.json all fail closed (TemporarilyUnavailableError, nothing sent);
  *  3. invalid_grant deletes tokens.json only if it still holds the RT that was sent;
- *  4. network errors / timeouts / 5xx / non-OAuth bodies are retried with backoff, all resends of
- *     one RT inside MAX_REFRESH_RETRY_WINDOW_MS (< the 60s server grace), and finally surface as
+ *  4. network errors / timeouts / 5xx / non-OAuth bodies are retried with backoff. Every send of
+ *     one RT — across all flights in this process — happens within MAX_REFRESH_RETRY_WINDOW_MS of
+ *     its first possibly-delivered send (< the 60s server grace). Failures surface as
  *     TemporarilyUnavailableError, which the SDK re-throws instead of opening a browser;
- *  5. the successor is persisted atomically (temp + rename, retried) before anyone uses it; if it
- *     cannot be persisted it is kept in memory so the rotated RT is never sent again.
+ *  5. the successor is persisted atomically (temp + rename, retried) before anyone uses it.
+ *
+ * Residual risk: if persisting the successor fails on every retry (disk broken), it is kept in
+ * THIS process's memory only — this process will not resend the rotated RT, but other
+ * mcp-remote processes still read the rotated RT from disk and may present it after the grace.
  */
 
 export type FetchLike = (url: string | URL, init?: RequestInit) => Promise<Response>
 
 export interface RefreshFetchOptions {
-  /** Max network attempts for one refresh (default 3). */
+  /** Max network attempts for one flight (default 3). */
   maxAttempts?: number
   /** Backoff base: retry n waits base * 2^(n-1) (default 500ms). */
   retryBaseDelayMs?: number
@@ -39,8 +44,12 @@ export interface RefreshFetchOptions {
   attemptTimeoutMs?: number
   /** All sends of one RT happen within this window; capped at MAX_REFRESH_RETRY_WINDOW_MS. */
   retryWindowMs?: number
-  /** A lock older than this is considered abandoned (default 60s). */
+  /** Lock considered abandoned when its heartbeat is older than this (default 30s, min 2s). */
   lockStaleMs?: number
+  /** Lock heartbeat interval (default 5s, min 1s). */
+  lockUpdateMs?: number
+  /** Max total time to wait for a contended lock (default 55s). */
+  lockWaitMs?: number
 }
 
 /** Server grace for re-presenting a just-rotated RT is 60s; keep every resend well inside it. */
@@ -51,21 +60,28 @@ const DEFAULTS: Required<RefreshFetchOptions> = {
   retryBaseDelayMs: 500,
   attemptTimeoutMs: 10_000,
   retryWindowMs: MAX_REFRESH_RETRY_WINDOW_MS,
-  lockStaleMs: 60_000,
+  lockStaleMs: 30_000,
+  lockUpdateMs: 5_000,
+  lockWaitMs: 55_000,
+}
+
+function withDefaults(options: RefreshFetchOptions): Required<RefreshFetchOptions> {
+  const defined = Object.fromEntries(Object.entries(options).filter(([, value]) => value !== undefined))
+  return { ...DEFAULTS, ...defined }
 }
 
 /** The effective window within which every send of one RT starts and finishes. */
 export function refreshRetryWindowMs(options: RefreshFetchOptions): number {
-  return Math.min(options.retryWindowMs ?? DEFAULTS.retryWindowMs, MAX_REFRESH_RETRY_WINDOW_MS)
+  return Math.min(withDefaults(options).retryWindowMs, MAX_REFRESH_RETRY_WINDOW_MS)
 }
 
-const LOCK_FILENAME = 'tokens.json.lock'
-const LOCK_POLL_MS = 50
-const BREAK_TOKEN_STALE_MS = 10_000
 const PERSIST_ATTEMPTS = 3
+const MAX_TRACKED_WINDOWS = 1_000
 
 /** OAuth error codes that mean "try again later", not "your grant is bad". */
 const TRANSIENT_OAUTH_ERRORS = new Set(['server_error', 'temporarily_unavailable'])
+/** Errors raised before the request could have reached the server. */
+const NOT_DELIVERED_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'ENETUNREACH', 'EHOSTUNREACH', 'UND_ERR_CONNECT_TIMEOUT'])
 
 interface ResponseSnapshot {
   status: number
@@ -74,14 +90,15 @@ interface ResponseSnapshot {
   body: string
 }
 
-// Per-server-hash state, shared by every provider / transport in this process.
-const inFlight = new Map<string, Promise<ResponseSnapshot>>()
-const lastCoordinated = new Map<string, OAuthTokens>()
-const rejectedRefreshTokens = new Map<string, string>()
-const unpersisted = new Map<string, { tokens: OAuthTokens; predecessor: string }>()
+// Process-wide state.
+const inFlight = new Map<string, Promise<ResponseSnapshot>>() // `${hash}\0${sha(rt)}`
+const rtWindowOpenedAt = new Map<string, number>() // `${hash}\0${sha(rt)}` → first possibly-delivered send
+const lastCoordinated = new Map<string, OAuthTokens>() // hash → tokens last persisted/adopted
+const rejectedRefreshTokens = new Map<string, string>() // hash → RT rejected with invalid_grant
+const unpersisted = new Map<string, { tokens: OAuthTokens; predecessor: string }>() // hash → successor
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
-const errCode = (error: unknown) => (error as NodeJS.ErrnoException | undefined)?.code
+const sha = (value: string) => createHash('sha256').update(value).digest('hex')
 
 function toResponse(snapshot: ResponseSnapshot): Response {
   return new Response(snapshot.body, {
@@ -101,155 +118,94 @@ function tokensSnapshot(serverUrlHash: string, tokens: OAuthTokens): ResponseSna
   }
 }
 
-function isPidAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (error) {
-    // EPERM: the process exists but belongs to someone else.
-    return errCode(error) === 'EPERM'
-  }
+/** Strict tokens.json read: undefined only if missing; otherwise throws a sanitized error. */
+export async function readTokensStrict(serverUrlHash: string): Promise<OAuthTokens | undefined> {
+  return readJsonFileStrict<OAuthTokens>(serverUrlHash, 'tokens.json', OAuthTokensSchema)
 }
 
-/** Reads tokens.json; undefined only if missing. Unreadable → TemporarilyUnavailableError. */
-async function readTokensUnderLock(serverUrlHash: string): Promise<OAuthTokens | undefined> {
+/** Strict read that maps "unreadable" to TemporarilyUnavailableError (never "missing"). */
+export async function readTokensOrUnavailable(serverUrlHash: string): Promise<OAuthTokens | undefined> {
   try {
-    return await readJsonFileStrict<OAuthTokens>(serverUrlHash, 'tokens.json', OAuthTokensSchema)
+    return await readTokensStrict(serverUrlHash)
   } catch (error) {
-    log(`tokens.json is unreadable (${describeFsError(error)}); not refreshing and not deleting it.`)
-    throw new TemporarilyUnavailableError('tokens.json is unreadable; refusing to refresh')
+    log(`tokens.json is unreadable (${describeFsError(error)}); not using, refreshing or deleting it.`)
+    throw new TemporarilyUnavailableError('tokens.json is unreadable')
   }
 }
 
 // ---------------------------------------------------------------------------------------------
-// Cross-process lock
-//
-// Acquire: the lock content is written to a private temp file first and then published with
-// link(temp, lock) — atomic and exclusive (EEXIST if held), and the lock is never visible
-// half-written. A lock instance is identified by dev+ino+mtime.
-//
-// Remove (release, or breaking a stale lock): exclusive per-instance break token
-// `<lock>.<id>.break` (O_EXCL). Every removal of instance <id> happens under that token after
-// re-checking that the lock is still <id>; the lock cannot become a different instance without
-// being removed first, so check-then-unlink cannot hit somebody else's lock.
+// Cross-process lock: proper-lockfile on the tokens.json path (lock dir `<tokens.json>.lock`).
 // ---------------------------------------------------------------------------------------------
 
-async function lockInstanceId(filePath: string): Promise<string | undefined> {
-  try {
-    const st = await fs.stat(filePath, { bigint: true })
-    return `${st.dev}-${st.ino}-${st.mtimeNs}`
-  } catch (error) {
-    if (errCode(error) === 'ENOENT') return undefined
-    throw error
+function lockRetries(waitMs: number) {
+  const minTimeout = 50
+  const maxTimeout = 1_000
+  let retries = 0
+  let total = 0
+  for (let delay = minTimeout; ; delay = Math.min(delay * 2, maxTimeout)) {
+    if (total + delay > waitMs) break
+    total += delay
+    retries++
   }
+  return { retries, minTimeout, maxTimeout, factor: 2, randomize: false }
 }
 
-async function isLockStale(lockPath: string, staleMs: number): Promise<boolean> {
-  let data: { pid?: unknown; timestamp?: unknown } | undefined
-  try {
-    data = JSON.parse(await fs.readFile(lockPath, 'utf-8'))
-  } catch (error) {
-    if (errCode(error) === 'ENOENT') return false
-    data = undefined
-  }
-  if (data && typeof data.pid === 'number' && typeof data.timestamp === 'number') {
-    return !isPidAlive(data.pid) || Date.now() - data.timestamp > staleMs
-  }
-  // Empty / unparseable / foreign lock: judge by mtime only.
-  try {
-    const st = await fs.stat(lockPath)
-    return Date.now() - st.mtimeMs > staleMs
-  } catch {
-    return false
-  }
-}
-
-/** Removes the lock iff it is still instance `id`. Returns without effect if someone else is on it. */
-async function removeLockInstance(lockPath: string, id: string): Promise<void> {
-  const token = `${lockPath}.${id}.break`
-  try {
-    await fs.writeFile(token, String(process.pid), { flag: 'wx', mode: 0o600 })
-  } catch (error) {
-    if (errCode(error) !== 'EEXIST') {
-      await fs.unlink(token).catch(() => {})
-      throw error
-    }
-    // Another process is removing this exact instance — or crashed doing so long ago.
-    const st = await fs.stat(token).catch(() => undefined)
-    if (st && Date.now() - st.mtimeMs > BREAK_TOKEN_STALE_MS) await fs.unlink(token).catch(() => {})
-    return
-  }
-  try {
-    if ((await lockInstanceId(lockPath)) === id) await fs.unlink(lockPath)
-  } finally {
-    await fs.unlink(token).catch(() => {})
-  }
+export interface TokensLockOptions extends Pick<RefreshFetchOptions, 'lockStaleMs' | 'lockUpdateMs' | 'lockWaitMs'> {
+  /**
+   * What to do when the lock cannot be acquired. 'fail' (default) throws
+   * TemporarilyUnavailableError. 'run-unlocked' runs `fn` anyway — only for writes whose loss is
+   * worse than a race (persisting a fresh browser-login result).
+   */
+  onUnavailable?: 'fail' | 'run-unlocked'
 }
 
 /**
- * Runs `fn` while holding the cross-process tokens lock for `serverUrlHash`.
- * Stale locks (dead owner PID, older than `lockStaleMs`, or unreadable with an old mtime) are broken.
+ * Runs `fn` while holding the cross-process tokens lock for `serverUrlHash`. `fn` receives a
+ * signal that aborts if the lock is compromised (heartbeat lost); the call then rejects with
+ * TemporarilyUnavailableError instead of proper-lockfile's default throw-in-a-timer.
  */
 export async function withTokensLock<T>(
   serverUrlHash: string,
-  fn: () => Promise<T>,
-  options: Pick<RefreshFetchOptions, 'lockStaleMs'> = {},
+  fn: (signal: AbortSignal) => Promise<T>,
+  options: TokensLockOptions = {},
 ): Promise<T> {
-  const staleMs = options.lockStaleMs ?? DEFAULTS.lockStaleMs
-  await ensureConfigDir()
-  const lockPath = getConfigFilePath(serverUrlHash, LOCK_FILENAME)
-  const tmpPath = `${lockPath}.${randomUUID()}.tmp`
-  let myId: string | undefined
+  const opts = withDefaults(options)
+  const controller = new AbortController()
+  let rejectCompromised: (error: Error) => void = () => {}
+  const compromised = new Promise<never>((_, reject) => {
+    rejectCompromised = reject
+  })
+  compromised.catch(() => {})
+
+  let release: (() => Promise<void>) | undefined
+  try {
+    await ensureConfigDir()
+    release = await lockfile.lock(getConfigFilePath(serverUrlHash, 'tokens.json'), {
+      realpath: false,
+      stale: opts.lockStaleMs,
+      update: opts.lockUpdateMs,
+      retries: lockRetries(opts.lockWaitMs),
+      onCompromised: (error) => {
+        log(`tokens lock compromised (${describeFsError(error)}); aborting the locked operation.`)
+        const reason = new TemporarilyUnavailableError('tokens lock was compromised')
+        controller.abort(reason)
+        rejectCompromised(reason)
+      },
+    })
+  } catch (error) {
+    if (options.onUnavailable === 'run-unlocked') {
+      log(`Could not lock tokens.json (${describeFsError(error)}); writing without the lock.`)
+      return fn(controller.signal)
+    }
+    log(`Could not lock tokens.json (${describeFsError(error)}).`)
+    throw new TemporarilyUnavailableError('tokens.json is locked by another mcp-remote process')
+  }
 
   try {
-    try {
-      await fs.writeFile(tmpPath, JSON.stringify({ pid: process.pid, timestamp: Date.now() }), {
-        flag: 'wx',
-        mode: 0o600,
-      })
-      myId = await lockInstanceId(tmpPath)
-    } catch (error) {
-      // Cannot create a lock at all (disk full, permissions) — not contention. Degrade to
-      // unlocked rather than breaking auth; in-process single-flight still applies.
-      log(`Could not create tokens lock (${describeFsError(error)}); continuing without cross-process lock.`)
-      await fs.unlink(tmpPath).catch(() => {})
-      return await fn()
-    }
-
-    const deadline = Date.now() + staleMs * 2
-    for (;;) {
-      try {
-        await fs.link(tmpPath, lockPath)
-        break
-      } catch (error) {
-        if (errCode(error) !== 'EEXIST') {
-          log(`Could not publish tokens lock (${describeFsError(error)}); continuing without cross-process lock.`)
-          myId = undefined
-          return await fn()
-        }
-      }
-      const heldId = await lockInstanceId(lockPath)
-      if (!heldId) continue
-      if (await isLockStale(lockPath, staleMs)) {
-        debugLog('Breaking stale tokens lock', { lockPath })
-        await removeLockInstance(lockPath, heldId)
-        continue
-      }
-      if (Date.now() > deadline) {
-        throw new TemporarilyUnavailableError('Timed out waiting for the tokens lock held by another mcp-remote process')
-      }
-      await sleep(LOCK_POLL_MS)
-    }
-    await fs.unlink(tmpPath).catch(() => {})
-
-    return await fn()
+    return await Promise.race([fn(controller.signal), compromised])
   } finally {
-    await fs.unlink(tmpPath).catch(() => {})
-    if (myId) {
-      await removeLockInstance(lockPath, myId).catch((error) => {
-        log(`Could not release tokens lock (${describeFsError(error)})`)
-      })
+    if (!controller.signal.aborted) {
+      await release().catch((error) => log(`Could not release tokens lock (${describeFsError(error)})`))
     }
   }
 }
@@ -288,12 +244,21 @@ function oauthErrorCode(snap: ResponseSnapshot): string | undefined {
   }
 }
 
+function wasNeverDelivered(error: unknown): boolean {
+  let current: any = error
+  for (let depth = 0; current && depth < 4; depth++) {
+    if (typeof current.code === 'string' && NOT_DELIVERED_CODES.has(current.code)) return true
+    current = current.cause
+  }
+  return false
+}
+
 type Attempt = { kind: 'ok'; tokens: OAuthTokens } | { kind: 'definitive'; snap: ResponseSnapshot }
 
 /**
  * One network round-trip, classified. Throws (with a message that never quotes the body) for
  * transient outcomes. The timeout is enforced by racing, so a fetch that ignores its signal
- * cannot hang the refresh.
+ * cannot hang the refresh; a compromised lock aborts it too.
  */
 async function attemptRefresh(
   baseFetch: FetchLike,
@@ -301,9 +266,12 @@ async function attemptRefresh(
   init: RequestInit,
   sentRefreshToken: string,
   timeoutMs: number,
+  lockSignal: AbortSignal,
 ): Promise<Attempt> {
   const controller = new AbortController()
   let timer: ReturnType<typeof setTimeout> | undefined
+  const onLockLost = () => controller.abort(lockSignal.reason)
+  lockSignal.addEventListener('abort', onLockLost, { once: true })
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
       const error = new Error(`token refresh timed out after ${timeoutMs}ms`)
@@ -337,6 +305,7 @@ async function attemptRefresh(
     return await Promise.race([work, timeout])
   } finally {
     clearTimeout(timer)
+    lockSignal.removeEventListener('abort', onLockLost)
   }
 }
 
@@ -359,12 +328,22 @@ async function persistTokens(
       if (attempt < PERSIST_ATTEMPTS) await sleep(opts.retryBaseDelayMs * 2 ** (attempt - 1))
     }
   }
-  // Keep the successor in memory: the predecessor is rotated server-side and must never be
-  // sent again from this process. tokens() serves it; the next refresh retries the write.
+  // In-memory fallback (this process only — see the residual-risk note at the top): tokens()
+  // serves the successor and the next refresh in this process retries the write first.
   unpersisted.set(serverUrlHash, { tokens, predecessor })
   lastCoordinated.set(serverUrlHash, tokens)
   log(`Could not persist refreshed tokens (${describeFsError(lastError)}); keeping them in memory.`)
   throw new TemporarilyUnavailableError('Refreshed tokens could not be persisted to disk')
+}
+
+function openRetryWindow(rtKey: string, now: number): boolean {
+  if (rtWindowOpenedAt.has(rtKey)) return false
+  if (rtWindowOpenedAt.size >= MAX_TRACKED_WINDOWS) {
+    const oldest = rtWindowOpenedAt.keys().next().value
+    if (oldest !== undefined) rtWindowOpenedAt.delete(oldest)
+  }
+  rtWindowOpenedAt.set(rtKey, now)
+  return true
 }
 
 async function coordinatedRefresh(
@@ -377,11 +356,11 @@ async function coordinatedRefresh(
 ): Promise<ResponseSnapshot> {
   return withTokensLock(
     serverUrlHash,
-    async () => {
-      let onDisk = await readTokensUnderLock(serverUrlHash)
+    async (lockSignal) => {
+      let onDisk = await readTokensOrUnavailable(serverUrlHash)
 
-      // A successor we obtained earlier but failed to persist: persist it now and treat it as
-      // the current tokens (as long as nothing newer landed on disk meanwhile).
+      // A successor obtained earlier by this process but not yet persisted: persist it now and
+      // treat it as current (unless something newer landed on disk meanwhile).
       const pending = unpersisted.get(serverUrlHash)
       if (pending) {
         if (!onDisk?.refresh_token || onDisk.refresh_token === pending.predecessor) {
@@ -399,25 +378,35 @@ async function coordinatedRefresh(
       }
 
       const windowMs = refreshRetryWindowMs(opts)
-      let firstSendAt: number | undefined
+      const rtKey = `${serverUrlHash}\0${sha(sentRefreshToken)}`
       let lastError: unknown
       for (let attempt = 1; attempt <= opts.maxAttempts; attempt++) {
+        if (lockSignal.aborted) throw lockSignal.reason
         const now = Date.now()
-        // Every send of this RT must start and finish inside the window (server grace is 60s).
-        const remaining = firstSendAt === undefined ? windowMs : firstSendAt + windowMs - now
-        if (remaining <= 0) break
-        firstSendAt ??= now
+        // Process-wide: every send of this RT starts and finishes inside the window opened by its
+        // first possibly-delivered send, whichever flight made it (server grace is 60s).
+        const openedAt = rtWindowOpenedAt.get(rtKey)
+        const remaining = openedAt === undefined ? windowMs : openedAt + windowMs - now
+        if (remaining <= 0) {
+          lastError ??= new Error('retry window for this refresh token has closed')
+          break
+        }
+        const openedHere = openRetryWindow(rtKey, now)
         let result: Attempt
         try {
-          result = await attemptRefresh(baseFetch, url, init, sentRefreshToken, Math.min(opts.attemptTimeoutMs, remaining))
+          result = await attemptRefresh(baseFetch, url, init, sentRefreshToken, Math.min(opts.attemptTimeoutMs, remaining), lockSignal)
         } catch (error) {
+          if (lockSignal.aborted) throw lockSignal.reason
           lastError = error
+          // The request never left this machine: the server cannot have seen this RT yet.
+          if (openedHere && wasNeverDelivered(error)) rtWindowOpenedAt.delete(rtKey)
           debugLog(`Token refresh attempt ${attempt}/${opts.maxAttempts} failed transiently`, {
             error: (error as Error)?.message,
           })
           if (attempt < opts.maxAttempts) {
             const delay = opts.retryBaseDelayMs * 2 ** (attempt - 1)
-            if (Date.now() + delay >= firstSendAt + windowMs) break
+            const opened = rtWindowOpenedAt.get(rtKey)
+            if (opened !== undefined && Date.now() + delay >= opened + windowMs) break
             await sleep(delay)
           }
           continue
@@ -430,7 +419,7 @@ async function coordinatedRefresh(
         }
 
         if (oauthErrorCode(result.snap) === 'invalid_grant') {
-          const current = await readTokensUnderLock(serverUrlHash)
+          const current = await readTokensOrUnavailable(serverUrlHash)
           if (current?.refresh_token && current.refresh_token !== sentRefreshToken) {
             log('Refresh rejected (invalid_grant) but tokens.json holds newer tokens; keeping and using them.')
             return tokensSnapshot(serverUrlHash, current)
@@ -472,26 +461,27 @@ function detachOnAbort<T>(promise: Promise<T>, signal: AbortSignal | null | unde
 }
 
 /**
- * Wraps `baseFetch` so every refresh_token grant is single-flighted per server, serialized
+ * Wraps `baseFetch` so every refresh_token grant is single-flighted per (server, RT), serialized
  * across processes, and retried on transient failures. All other requests pass through.
  */
 export function createRefreshCoordinatedFetch(serverUrlHash: string, baseFetch: FetchLike, options: RefreshFetchOptions = {}): FetchLike {
-  const opts: Required<RefreshFetchOptions> = { ...DEFAULTS, ...options }
+  const opts = withDefaults(options)
   return async (url, init) => {
     const sentRefreshToken = refreshTokenOf(init)
     if (!sentRefreshToken || !init) return baseFetch(url, init)
 
-    let shared = inFlight.get(serverUrlHash)
+    const flightKey = `${serverUrlHash}\0${sha(sentRefreshToken)}`
+    let shared = inFlight.get(flightKey)
     if (shared) {
       debugLog('Joining in-flight token refresh (single-flight)')
     } else {
       // The shared flight must not inherit any one caller's signal.
       const { signal: _callerSignal, ...flightInit } = init
       shared = coordinatedRefresh(serverUrlHash, baseFetch, url, flightInit, sentRefreshToken, opts).finally(() => {
-        inFlight.delete(serverUrlHash)
+        inFlight.delete(flightKey)
       })
       shared.catch(() => {}) // every caller may have detached
-      inFlight.set(serverUrlHash, shared)
+      inFlight.set(flightKey, shared)
     }
     return toResponse(await detachOnAbort(shared, init.signal))
   }
@@ -518,17 +508,12 @@ export function clearRejectedRefreshToken(serverUrlHash: string): void {
 }
 
 /**
- * A successor that could not be persisted yet, if `onDisk` still holds its (rotated)
- * predecessor — callers must use it instead of the on-disk tokens.
+ * This process's not-yet-persisted successor, if `onDisk` still holds its rotated predecessor —
+ * callers in this process use it instead of the on-disk tokens.
  */
 export function unpersistedSuccessorFor(serverUrlHash: string, onDisk: OAuthTokens | undefined): OAuthTokens | undefined {
   const pending = unpersisted.get(serverUrlHash)
   if (!pending) return undefined
   if (onDisk?.refresh_token && onDisk.refresh_token !== pending.predecessor) return undefined
   return pending.tokens
-}
-
-/** Strict tokens.json read for callers that must not confuse "unreadable" with "missing". */
-export async function readTokensStrict(serverUrlHash: string): Promise<OAuthTokens | undefined> {
-  return readJsonFileStrict<OAuthTokens>(serverUrlHash, 'tokens.json', OAuthTokensSchema)
 }

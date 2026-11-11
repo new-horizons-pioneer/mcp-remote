@@ -1,11 +1,6 @@
 import open from 'open'
 import { OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js'
-import {
-  OAuthClientInformationFull,
-  OAuthClientInformationFullSchema,
-  OAuthTokens,
-  OAuthTokensSchema,
-} from '@modelcontextprotocol/sdk/shared/auth.js'
+import { OAuthClientInformationFull, OAuthClientInformationFullSchema, OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js'
 import type { OAuthProviderOptions, StaticOAuthClientMetadata } from './types'
 import { readJsonFile, writeJsonFile, readTextFile, writeTextFile, deleteConfigFile } from './mcp-auth-config'
 import { StaticOAuthClientInformationFull } from './types'
@@ -18,6 +13,7 @@ import {
   createRefreshCoordinatedFetch,
   clearRejectedRefreshToken,
   isCoordinatorPersisted,
+  readTokensOrUnavailable,
   readTokensStrict,
   rejectedRefreshTokenFor,
   unpersistedSuccessorFor,
@@ -212,9 +208,11 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    * Reads the persisted tokens from disk WITHOUT mutating `lastReadAccessToken`.
    * Used by the concurrent-refresh guards so their bookkeeping reads don't
    * clobber the "token we last served to a transport" signal.
+   * Strict: a missing file is `undefined`, an unreadable one throws TemporarilyUnavailableError
+   * (never mistaken for "no tokens", which would send the SDK into a browser flow).
    */
   private async readPersistedTokens(): Promise<OAuthTokens | undefined> {
-    return readJsonFile<OAuthTokens>(this.serverUrlHash, 'tokens.json', OAuthTokensSchema)
+    return readTokensOrUnavailable(this.serverUrlHash)
   }
 
   /**
@@ -295,7 +293,11 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       return
     }
 
-    await withTokensLock(this.serverUrlHash, () => writeJsonFile(this.serverUrlHash, 'tokens.json', tokens))
+    // A fresh login result is worth more than the race the lock guards against: if the lock is
+    // unavailable, write (atomically) anyway.
+    await withTokensLock(this.serverUrlHash, () => writeJsonFile(this.serverUrlHash, 'tokens.json', tokens), {
+      onUnavailable: 'run-unlocked',
+    })
     clearRejectedRefreshToken(this.serverUrlHash)
   }
 

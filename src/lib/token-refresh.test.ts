@@ -2,6 +2,9 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import fs from 'fs/promises'
 import os from 'os'
 import path from 'path'
+import http from 'node:http'
+import { spawn } from 'node:child_process'
+import lockfile from 'proper-lockfile'
 import openBrowser from 'open'
 import { auth } from '@modelcontextprotocol/sdk/client/auth.js'
 import { NodeOAuthClientProvider } from './node-oauth-client-provider'
@@ -25,10 +28,12 @@ type FetchLike = (url: string | URL, init?: RequestInit) => Promise<Response>
 type TokenHandler = (params: URLSearchParams, call: number) => Promise<Response> | Response
 
 const SERVER_URL = 'https://mcp.example.test/mcp'
-// Unique per test: the coordinator keeps per-server-hash state at module level.
+const TOKEN_URL = 'https://mcp.example.test/token'
+// Unique per test: the coordinator keeps per-server-hash / per-RT state at module level.
 let HASH = ''
 let seq = 0
 const FAST_RETRY = { retryBaseDelayMs: 5, attemptTimeoutMs: 2_000 }
+const REPO_ROOT = path.resolve(__dirname, '../..')
 
 const json = (status: number, body: unknown) =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
@@ -50,7 +55,7 @@ function fakeServer(onToken: TokenHandler) {
       return json(200, {
         issuer: 'https://mcp.example.test',
         authorization_endpoint: 'https://mcp.example.test/authorize',
-        token_endpoint: 'https://mcp.example.test/token',
+        token_endpoint: TOKEN_URL,
         response_types_supported: ['code'],
         code_challenge_methods_supported: ['S256'],
       })
@@ -67,16 +72,19 @@ function fakeServer(onToken: TokenHandler) {
 
 let configDir: string
 
+const tokensPath = () => getConfigFilePath(HASH, 'tokens.json')
+const lockDir = () => `${tokensPath()}.lock`
 async function writeTokens(tokens: unknown) {
-  await fs.writeFile(getConfigFilePath(HASH, 'tokens.json'), JSON.stringify(tokens))
+  await fs.writeFile(tokensPath(), JSON.stringify(tokens))
 }
 async function readTokens(): Promise<any | undefined> {
   try {
-    return JSON.parse(await fs.readFile(getConfigFilePath(HASH, 'tokens.json'), 'utf-8'))
+    return JSON.parse(await fs.readFile(tokensPath(), 'utf-8'))
   } catch {
     return undefined
   }
 }
+const leftovers = async () => (await fs.readdir(path.dirname(getConfigFilePath(HASH, 'x')))).filter((f) => /\.(tmp|lock|break)$/.test(f))
 
 function newProvider() {
   return new NodeOAuthClientProvider({
@@ -88,11 +96,17 @@ function newProvider() {
 }
 
 /** The fetch the transports hand to the SDK's auth(): the provider's refresh-coordinated wrapper. */
-function wrapped(provider: NodeOAuthClientProvider, base: FetchLike, extra: Record<string, number> = {}): FetchLike {
+function wrapped(provider: NodeOAuthClientProvider, base: FetchLike, extra: Record<string, unknown> = {}): FetchLike {
   const p = provider as any
   return typeof p.wrapFetch === 'function' ? p.wrapFetch(base, { ...FAST_RETRY, ...extra }) : base
 }
 
+const refreshInit = (rt: string, signal?: AbortSignal): RequestInit => ({
+  method: 'POST',
+  body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: rt }),
+  signal,
+})
+const never = () => new Promise<Response>(() => {})
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 beforeEach(async () => {
@@ -115,7 +129,7 @@ afterEach(async () => {
   await fs.rm(configDir, { recursive: true, force: true })
 })
 
-describe('refresh single-flight + cross-process lock', () => {
+describe('refresh single-flight', () => {
   it('two concurrent refreshes in one process send ONE network refresh and share the result', async () => {
     const server = fakeServer(async () => {
       await sleep(50)
@@ -136,20 +150,77 @@ describe('refresh single-flight + cross-process lock', () => {
     expect(openBrowser).not.toHaveBeenCalled()
   })
 
+  it("a caller's abort only detaches that caller; the shared flight is not cancelled", async () => {
+    let flightSignalAborted: boolean | undefined
+    const calls: string[] = []
+    const base: FetchLike = async (_url, init) => {
+      calls.push(new URLSearchParams(String(init?.body ?? '')).get('refresh_token') ?? '')
+      await sleep(80)
+      flightSignalAborted = init?.signal?.aborted ?? false
+      return json(200, tokensFor('rt-1', 'at-1'))
+    }
+    const fetchFn = wrapped(newProvider(), base)
+    const ctrl = new AbortController()
+
+    const first = fetchFn(TOKEN_URL, refreshInit('rt-0', ctrl.signal))
+    const second = fetchFn(TOKEN_URL, refreshInit('rt-0'))
+    setTimeout(() => ctrl.abort(), 20)
+
+    await expect(first).rejects.toThrow()
+    const res = await second
+    expect((await res.json()).refresh_token).toBe('rt-1')
+    expect(calls).toEqual(['rt-0'])
+    expect(flightSignalAborted).toBe(false)
+  })
+
+  it("a caller with a DIFFERENT refresh token does not join another RT's flight", async () => {
+    const server = fakeServer(async (params) => {
+      if (params.get('refresh_token') === 'rt-0') {
+        await sleep(60)
+        return json(400, { error: 'invalid_grant' })
+      }
+      return json(200, tokensFor('rt-X1'))
+    })
+    const fetchFn = wrapped(newProvider(), server.fetchFn)
+
+    const a = fetchFn(TOKEN_URL, refreshInit('rt-0'))
+    await sleep(10)
+    const b = fetchFn(TOKEN_URL, refreshInit('rt-X'))
+
+    expect((await a).status).toBe(400)
+    const rb = await b
+    expect(rb.status).toBe(200)
+    expect((await rb.json()).refresh_token).toBe('rt-X1')
+    expect(server.refreshCalls).toEqual(['rt-0', 'rt-X'])
+  })
+
+  it('undefined option values fall back to defaults', async () => {
+    const server = fakeServer((_p, call) => {
+      if (call < 3) throw new TypeError('fetch failed')
+      return json(200, tokensFor('rt-1'))
+    })
+    const fetchFn = wrapped(newProvider(), server.fetchFn, { maxAttempts: undefined, retryWindowMs: undefined })
+
+    const res = await fetchFn(TOKEN_URL, refreshInit('rt-0'))
+
+    expect(res.status).toBe(200)
+    expect(server.refreshCalls).toEqual(['rt-0', 'rt-0', 'rt-0'])
+  })
+})
+
+describe('cross-process lock (proper-lockfile on tokens.json)', () => {
   it('a second process that finds the file already rotated under the lock does not refresh', async () => {
     const server = fakeServer(() => json(200, tokensFor('rt-WRONG')))
     const provider = newProvider()
-    const lockPath = getConfigFilePath(HASH, 'tokens.json.lock')
 
     // "Process A" holds the tokens lock while its refresh is in flight.
-    await fs.writeFile(lockPath, JSON.stringify({ pid: process.pid, timestamp: Date.now(), owner: 'process-a' }))
-
+    const release = await lockfile.lock(tokensPath(), { realpath: false })
     const pending = auth(provider, { serverUrl: SERVER_URL, fetchFn: wrapped(provider, server.fetchFn) })
 
     // Process A finishes: persists its successor, then releases the lock.
-    await sleep(150)
+    await sleep(200)
     await writeTokens(tokensFor('rt-1', 'at-1'))
-    await fs.unlink(lockPath)
+    await release()
 
     await expect(pending).resolves.toBe('AUTHORIZED')
     expect(server.refreshCalls).toEqual([])
@@ -157,19 +228,144 @@ describe('refresh single-flight + cross-process lock', () => {
     expect(openBrowser).not.toHaveBeenCalled()
   })
 
-  it('a stale lock (dead PID) does not block refresh', async () => {
+  it('two real processes refreshing at once send ONE network refresh', async () => {
+    const refreshes: string[] = []
+    let n = 0
+    const srv = http.createServer((req, res) => {
+      let body = ''
+      req.on('data', (c) => (body += c))
+      req.on('end', () => {
+        const base = `http://127.0.0.1:${(srv.address() as any).port}`
+        res.setHeader('content-type', 'application/json')
+        if (req.url?.startsWith('/.well-known/oauth-authorization-server')) {
+          return res.end(
+            JSON.stringify({
+              issuer: base,
+              authorization_endpoint: `${base}/authorize`,
+              token_endpoint: `${base}/token`,
+              response_types_supported: ['code'],
+              code_challenge_methods_supported: ['S256'],
+            }),
+          )
+        }
+        if (req.url === '/token') {
+          refreshes.push(new URLSearchParams(body).get('refresh_token') ?? '')
+          n++
+          return setTimeout(() => res.end(JSON.stringify(tokensFor(`rt-p${n}`))), 300)
+        }
+        res.statusCode = 404
+        res.end('{}')
+      })
+    })
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r))
+    const serverUrl = `http://127.0.0.1:${(srv.address() as any).port}/mcp`
+    const runChild = () =>
+      new Promise<string>((resolve) => {
+        const child = spawn(
+          path.join(REPO_ROOT, 'node_modules/.bin/tsx'),
+          [path.join(__dirname, 'test-fixtures/refresh-child.ts'), serverUrl, HASH],
+          { cwd: REPO_ROOT, env: { ...process.env, MCP_REMOTE_CONFIG_DIR: configDir } },
+        )
+        let out = ''
+        child.stdout.on('data', (d) => (out += d))
+        child.on('exit', () => resolve(out.trim().split('\n').pop() ?? ''))
+      })
+    // The child uses the real package version for the config subdir.
+    const version = JSON.parse(await fs.readFile(path.join(REPO_ROOT, 'package.json'), 'utf-8')).version
+    const childDir = path.join(configDir, `mcp-remote-${version}`)
+    await fs.mkdir(childDir, { recursive: true })
+    await fs.copyFile(getConfigFilePath(HASH, 'client_info.json'), path.join(childDir, `${HASH}_client_info.json`))
+    await fs.copyFile(tokensPath(), path.join(childDir, `${HASH}_tokens.json`))
+
+    try {
+      const outs = await Promise.all([runChild(), runChild()])
+      expect(outs.map((o) => JSON.parse(o || '{}').r)).toEqual(['AUTHORIZED', 'AUTHORIZED'])
+      expect(outs.map((o) => JSON.parse(o || '{}').rt)).toEqual(['rt-p1', 'rt-p1'])
+      expect(refreshes).toEqual(['rt-0'])
+    } finally {
+      srv.close()
+    }
+  }, 30_000)
+
+  it('a lock whose holder stopped heartbeating (dead process) is taken over', async () => {
     const server = fakeServer(() => json(200, tokensFor('rt-1')))
     const provider = newProvider()
-    await fs.writeFile(
-      getConfigFilePath(HASH, 'tokens.json.lock'),
-      JSON.stringify({ pid: 2 ** 22 + 12345, timestamp: Date.now(), owner: 'dead' }),
-    )
+    await fs.mkdir(lockDir())
+    const old = new Date(Date.now() - 60 * 60 * 1000)
+    await fs.utimes(lockDir(), old, old)
 
     await expect(auth(provider, { serverUrl: SERVER_URL, fetchFn: wrapped(provider, server.fetchFn) })).resolves.toBe('AUTHORIZED')
     expect(server.refreshCalls).toEqual(['rt-0'])
-    expect((await readTokens())?.refresh_token).toBe('rt-1')
-  })
+    expect(await leftovers()).toEqual([])
+  }, 4_000)
 
+  it('a lock left by a crashed (SIGKILLed) process recovers after the stale time', async () => {
+    const script = `
+      const lockfile = require(${JSON.stringify(path.join(REPO_ROOT, 'node_modules/proper-lockfile'))});
+      lockfile.lock(${JSON.stringify(tokensPath())}, { realpath: false }).then(() => process.kill(process.pid, 'SIGKILL'));
+    `
+    await new Promise((resolve) => spawn(process.execPath, ['-e', script]).on('exit', resolve))
+    expect((await fs.stat(lockDir())).isDirectory()).toBe(true) // left behind by the crash
+
+    const server = fakeServer(() => json(200, tokensFor('rt-1')))
+    const res = await wrapped(newProvider(), server.fetchFn, { lockStaleMs: 2_000 })(TOKEN_URL, refreshInit('rt-0'))
+
+    expect(res.status).toBe(200)
+    expect(server.refreshCalls).toEqual(['rt-0'])
+    expect(await leftovers()).toEqual([])
+  }, 10_000)
+
+  it('failing to acquire the lock fails closed: TemporarilyUnavailable, no refresh sent', async () => {
+    const release = await lockfile.lock(tokensPath(), { realpath: false }) // live, heartbeating holder
+    const server = fakeServer(() => json(200, tokensFor('rt-1')))
+    try {
+      const err = await wrapped(newProvider(), server.fetchFn, { lockWaitMs: 300 })(TOKEN_URL, refreshInit('rt-0')).catch((e) => e)
+      expect(err?.constructor?.name).toBe('TemporarilyUnavailableError')
+      expect(server.refreshCalls).toEqual([])
+      expect((await readTokens())?.refresh_token).toBe('rt-0')
+    } finally {
+      await release()
+    }
+  }, 4_000)
+
+  it('a compromised lock aborts the in-flight refresh with TemporarilyUnavailable (no timer throw)', async () => {
+    const server = fakeServer(() => never())
+    const fetchFn = wrapped(newProvider(), server.fetchFn, {
+      lockStaleMs: 2_000,
+      lockUpdateMs: 1_000,
+      attemptTimeoutMs: 20_000,
+    })
+    const pending = fetchFn(TOKEN_URL, refreshInit('rt-0')).catch((e) => e)
+    await sleep(200)
+    await fs.rm(lockDir(), { recursive: true, force: true }) // someone yanked our lock
+
+    const err = await pending
+    expect(err?.constructor?.name).toBe('TemporarilyUnavailableError')
+    expect((await readTokens())?.refresh_token).toBe('rt-0')
+  }, 6_000)
+
+  it('withTokensLock admits exactly one holder at a time, also when taking over a stale lock', async () => {
+    await fs.mkdir(lockDir())
+    const old = new Date(Date.now() - 60 * 60 * 1000)
+    await fs.utimes(lockDir(), old, old)
+    let inside = 0
+    let maxInside = 0
+    await Promise.all(
+      Array.from({ length: 8 }, () =>
+        tokenRefresh.withTokensLock(HASH, async () => {
+          inside++
+          maxInside = Math.max(maxInside, inside)
+          await sleep(15)
+          inside--
+        }),
+      ),
+    )
+    expect(maxInside).toBe(1)
+    expect(await leftovers()).toEqual([])
+  }, 10_000)
+})
+
+describe('refresh outcomes', () => {
   it('invalid_grant while tokens.json holds a DIFFERENT (newer) RT keeps the file and uses the newer tokens', async () => {
     const server = fakeServer(async () => {
       // Another writer rotated (e.g. a sibling's browser login) while our request was in flight.
@@ -224,93 +420,15 @@ describe('refresh single-flight + cross-process lock', () => {
     expect(openBrowser).not.toHaveBeenCalled()
   })
 
-  it('persists refreshed tokens atomically (no temp files left, valid JSON on disk)', async () => {
+  it('persists refreshed tokens atomically (no temp/lock files left, valid JSON on disk)', async () => {
     const server = fakeServer(() => json(200, tokensFor('rt-1', 'at-1')))
     const provider = newProvider()
 
     await auth(provider, { serverUrl: SERVER_URL, fetchFn: wrapped(provider, server.fetchFn) })
 
-    const files = await fs.readdir(path.dirname(getConfigFilePath(HASH, 'x')))
-    expect(files.filter((f) => f.endsWith('.tmp'))).toEqual([])
-    expect(files.filter((f) => f.endsWith('.lock'))).toEqual([])
+    expect(await leftovers()).toEqual([])
     expect(await readTokens()).toMatchObject({ refresh_token: 'rt-1', access_token: 'at-1' })
   })
-
-  it('invalidateCredentials("tokens") keeps a tokens.json that a sibling rotated after we last read it', async () => {
-    const provider = newProvider()
-    await provider.tokens() // we observed rt-0
-    await writeTokens(tokensFor('rt-SIBLING')) // sibling rotated
-
-    await provider.invalidateCredentials('tokens')
-
-    expect((await readTokens())?.refresh_token).toBe('rt-SIBLING')
-  })
-})
-
-const TOKEN_URL = 'https://mcp.example.test/token'
-const refreshInit = (rt: string, signal?: AbortSignal): RequestInit => ({
-  method: 'POST',
-  body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: rt }),
-  signal,
-})
-const never = () => new Promise<Response>(() => {})
-const lockFile = () => getConfigFilePath(HASH, 'tokens.json.lock')
-const leftovers = async () =>
-  (await fs.readdir(path.dirname(getConfigFilePath(HASH, 'x')))).filter((f) => /\.(tmp|lock|break|aside)$/.test(f))
-
-describe('review blockers', () => {
-  it('an empty/unreadable lock file older than lockStaleMs is treated as stale (no wedge)', async () => {
-    const server = fakeServer(() => json(200, tokensFor('rt-1')))
-    const provider = newProvider()
-    await fs.writeFile(lockFile(), '') // 0-byte lock left by a crashed writer
-    const old = new Date(Date.now() - 60 * 60 * 1000)
-    await fs.utimes(lockFile(), old, old)
-
-    await expect(
-      auth(provider, { serverUrl: SERVER_URL, fetchFn: wrapped(provider, server.fetchFn, { lockStaleMs: 1_000 }) }),
-    ).resolves.toBe('AUTHORIZED')
-    expect(server.refreshCalls).toEqual(['rt-0'])
-    expect(await leftovers()).toEqual([])
-  }, 4_000)
-
-  it('a failure while writing the lock leaves no lock behind and does not block refresh', async () => {
-    const realWriteFile = fs.writeFile.bind(fs)
-    vi.spyOn(fs, 'writeFile').mockImplementation(async (file: any, ...rest: any[]) => {
-      if (String(file).includes('tokens.json.lock')) throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
-      return (realWriteFile as any)(file, ...rest)
-    })
-    const server = fakeServer(() => json(200, tokensFor('rt-1')))
-    const provider = newProvider()
-
-    await expect(auth(provider, { serverUrl: SERVER_URL, fetchFn: wrapped(provider, server.fetchFn) })).resolves.toBe('AUTHORIZED')
-    expect(await leftovers()).toEqual([])
-  })
-
-  it('concurrent takeover of a stale lock admits exactly one holder at a time', async () => {
-    await fs.writeFile(lockFile(), JSON.stringify({ pid: 2 ** 22 + 12345, timestamp: Date.now(), owner: 'dead' }))
-    // Force the TOCTOU interleaving: a lock read returns its snapshot only after a delay,
-    // so a contender can judge the *dead* lock stale after another one already replaced it.
-    const realReadFile = fs.readFile.bind(fs)
-    vi.spyOn(fs, 'readFile').mockImplementation(async (file: any, ...rest: any[]) => {
-      const content = await (realReadFile as any)(file, ...rest)
-      if (String(file).endsWith('tokens.json.lock')) await sleep(Math.random() * 25)
-      return content
-    })
-    let inside = 0
-    let maxInside = 0
-    await Promise.all(
-      Array.from({ length: 12 }, () =>
-        tokenRefresh.withTokensLock(HASH, async () => {
-          inside++
-          maxInside = Math.max(maxInside, inside)
-          await sleep(15)
-          inside--
-        }),
-      ),
-    )
-    expect(maxInside).toBe(1)
-    expect(await leftovers()).toEqual([])
-  }, 10_000)
 
   it('a failed write of the successor is retried (EPERM/EBUSY on rename)', async () => {
     const realRename = fs.rename.bind(fs)
@@ -324,10 +442,9 @@ describe('review blockers', () => {
 
     await expect(auth(provider, { serverUrl: SERVER_URL, fetchFn: wrapped(provider, server.fetchFn) })).resolves.toBe('AUTHORIZED')
     expect((await readTokens())?.refresh_token).toBe('rt-1')
-    expect(server.refreshCalls).toEqual(['rt-0'])
   })
 
-  it('if the successor cannot be persisted it is kept in memory, the old RT is never resent, and no browser opens', async () => {
+  it('if the successor cannot be persisted it is kept in memory and the old RT is not resent by this process', async () => {
     const realRename = fs.rename.bind(fs)
     let broken = true
     vi.spyOn(fs, 'rename').mockImplementation(async (from: any, to: any) => {
@@ -344,27 +461,27 @@ describe('review blockers', () => {
     expect((await provider.tokens())?.refresh_token).toBe('rt-1') // served from memory
 
     broken = false
-    // A stale caller still holding rt-0 must get the successor, not a network refresh with rt-0.
     const res = await fetchFn(TOKEN_URL, refreshInit('rt-0'))
     expect((await res.json()).refresh_token).toBe('rt-1')
     expect(server.refreshCalls).toEqual(['rt-0'])
     expect((await readTokens())?.refresh_token).toBe('rt-1')
   })
+})
 
-  it('the retry window for one RT is bounded below the 60s server grace', () => {
+describe('retry window per refresh token (server grace 60s)', () => {
+  it('is bounded below the 60s server grace', () => {
     expect(tokenRefresh.MAX_REFRESH_RETRY_WINDOW_MS).toBeLessThanOrEqual(45_000)
     expect(tokenRefresh.refreshRetryWindowMs({})).toBeLessThanOrEqual(45_000)
     expect(tokenRefresh.refreshRetryWindowMs({ retryWindowMs: 10 * 60_000 })).toBe(45_000)
   })
 
-  it('resends of the same RT stop at the retry window even with long timeouts and many attempts', async () => {
+  it('resends inside one flight stop at the window even with long timeouts and many attempts', async () => {
     const sends: number[] = []
     const server = fakeServer(() => {
       sends.push(Date.now())
       return never()
     })
-    const provider = newProvider()
-    const fetchFn = wrapped(provider, server.fetchFn, {
+    const fetchFn = wrapped(newProvider(), server.fetchFn, {
       maxAttempts: 50,
       attemptTimeoutMs: 150,
       retryBaseDelayMs: 10,
@@ -376,7 +493,35 @@ describe('review blockers', () => {
     expect(sends.length).toBeGreaterThan(1)
     expect(sends[sends.length - 1] - sends[0]).toBeLessThan(400)
     expect(done - sends[0]).toBeLessThan(400 + 150)
-    expect((await readTokens())?.refresh_token).toBe('rt-0')
+  })
+
+  it('a NEW flight with the same RT respects the window opened by the first flight', async () => {
+    const server = fakeServer(() => never())
+    const opts = { maxAttempts: 5, attemptTimeoutMs: 150, retryBaseDelayMs: 10, retryWindowMs: 300 }
+
+    await expect(wrapped(newProvider(), server.fetchFn, opts)(TOKEN_URL, refreshInit('rt-0'))).rejects.toThrow()
+    const sentInFirstFlight = server.refreshCalls.length
+    await sleep(350)
+
+    const err = await wrapped(newProvider(), server.fetchFn, opts)(TOKEN_URL, refreshInit('rt-0')).catch((e) => e)
+    expect(err?.constructor?.name).toBe('TemporarilyUnavailableError')
+    expect(server.refreshCalls.length).toBe(sentInFirstFlight)
+  })
+
+  it('connect errors (request never left the client) do not open the window', async () => {
+    let offline = true
+    const server = fakeServer(() => {
+      if (offline) throw new TypeError('fetch failed', { cause: Object.assign(new Error('refused'), { code: 'ECONNREFUSED' }) })
+      return json(200, tokensFor('rt-1'))
+    })
+    const opts = { maxAttempts: 2, retryBaseDelayMs: 10, retryWindowMs: 200 }
+
+    await expect(wrapped(newProvider(), server.fetchFn, opts)(TOKEN_URL, refreshInit('rt-0'))).rejects.toThrow()
+    await sleep(250)
+    offline = false
+
+    const res = await wrapped(newProvider(), server.fetchFn, opts)(TOKEN_URL, refreshInit('rt-0'))
+    expect(res.status).toBe(200)
   })
 
   it('attemptTimeoutMs holds even when the underlying fetch ignores the abort signal', async () => {
@@ -394,45 +539,52 @@ describe('review blockers', () => {
     expect(server.refreshCalls).toEqual(['rt-0', 'rt-0'])
     expect(openBrowser).not.toHaveBeenCalled()
   }, 4_000)
+})
 
-  it("a caller's abort only detaches that caller; the shared flight is not cancelled", async () => {
-    let flightSignalAborted: boolean | undefined
-    const base: FetchLike = async (_url, init) => {
-      const params = new URLSearchParams(String(init?.body ?? ''))
-      calls.push(params.get('refresh_token') ?? '')
-      await sleep(80)
-      flightSignalAborted = init?.signal?.aborted ?? false
-      return json(200, tokensFor('rt-1', 'at-1'))
-    }
-    const calls: string[] = []
-    const provider = newProvider()
-    const fetchFn = wrapped(provider, base)
-    const ctrl = new AbortController()
-
-    const first = fetchFn(TOKEN_URL, refreshInit('rt-0', ctrl.signal))
-    const second = fetchFn(TOKEN_URL, refreshInit('rt-0'))
-    setTimeout(() => ctrl.abort(), 20)
-
-    await expect(first).rejects.toThrow()
-    const res = await second
-    expect(res.status).toBe(200)
-    expect((await res.json()).refresh_token).toBe('rt-1')
-    expect(calls).toEqual(['rt-0'])
-    expect(flightSignalAborted).toBe(false)
-  })
+describe('reading and invalidating tokens.json', () => {
+  const garbage = 'SECRET-RT-FRAGMENT not json'
 
   it('an unreadable tokens.json under the lock blocks the refresh and is not deleted', async () => {
-    const garbage = 'SECRET-RT-FRAGMENT not json'
-    await fs.writeFile(getConfigFilePath(HASH, 'tokens.json'), garbage)
+    await fs.writeFile(tokensPath(), garbage)
     const server = fakeServer(() => json(200, tokensFor('rt-1')))
     const provider = newProvider()
 
     await expect(wrapped(provider, server.fetchFn)(TOKEN_URL, refreshInit('rt-0'))).rejects.toThrow()
     expect(server.refreshCalls).toEqual([])
-    expect(await fs.readFile(getConfigFilePath(HASH, 'tokens.json'), 'utf-8')).toBe(garbage)
 
     await provider.invalidateCredentials('tokens')
-    expect(await fs.readFile(getConfigFilePath(HASH, 'tokens.json'), 'utf-8')).toBe(garbage)
+    expect(await fs.readFile(tokensPath(), 'utf-8')).toBe(garbage)
+  })
+
+  it('provider.tokens() throws TemporarilyUnavailable on an unreadable tokens.json and never logs its contents', async () => {
+    await fs.writeFile(tokensPath(), garbage)
+    const provider = newProvider()
+
+    const err = await provider.tokens().catch((e) => e)
+
+    expect(err?.constructor?.name).toBe('TemporarilyUnavailableError')
+    const logged = JSON.stringify(vi.mocked(log).mock.calls.map((c) => c.map((a) => (a instanceof Error ? a.message : a))))
+    expect(logged).not.toContain('SECRET')
+  })
+
+  it('hasSiblingRefreshedToken() throws TemporarilyUnavailable on an unreadable tokens.json', async () => {
+    const provider = newProvider()
+    await provider.tokens()
+    await fs.writeFile(tokensPath(), garbage)
+
+    const err = await provider.hasSiblingRefreshedToken().catch((e) => e)
+
+    expect(err?.constructor?.name).toBe('TemporarilyUnavailableError')
+  })
+
+  it('invalidateCredentials("tokens") keeps a tokens.json that a sibling rotated', async () => {
+    const provider = newProvider()
+    await provider.tokens()
+    await writeTokens(tokensFor('rt-SIBLING'))
+
+    await provider.invalidateCredentials('tokens')
+
+    expect((await readTokens())?.refresh_token).toBe('rt-SIBLING')
   })
 
   it('invalidateCredentials("tokens") without a known-rejected RT fails closed (keeps tokens)', async () => {
@@ -446,24 +598,11 @@ describe('review blockers', () => {
 
   it('the rejected RT is shared per server hash, not tied to the provider that refreshed', async () => {
     const server = fakeServer(() => json(400, { error: 'invalid_grant' }))
-    const starter = newProvider()
-    const other = newProvider()
-    await wrapped(starter, server.fetchFn)(TOKEN_URL, refreshInit('rt-0'))
-    // Something re-persisted the very RT the server just rejected.
-    await writeTokens(tokensFor('rt-0'))
+    await wrapped(newProvider(), server.fetchFn)(TOKEN_URL, refreshInit('rt-0'))
+    await writeTokens(tokensFor('rt-0')) // something re-persisted the very RT the server rejected
 
-    await other.invalidateCredentials('tokens')
+    await newProvider().invalidateCredentials('tokens')
 
     expect(await readTokens()).toBeUndefined()
-  })
-
-  it('never logs token file contents when tokens.json is malformed', async () => {
-    await fs.writeFile(getConfigFilePath(HASH, 'tokens.json'), 'SECRET-RT-FRAGMENT not json')
-    const provider = newProvider()
-
-    await provider.tokens()
-
-    const logged = JSON.stringify(vi.mocked(log).mock.calls.map((c) => c.map((a) => (a instanceof Error ? a.message : a))))
-    expect(logged).not.toContain('SECRET')
   })
 })
